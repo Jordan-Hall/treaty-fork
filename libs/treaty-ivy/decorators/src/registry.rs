@@ -99,6 +99,113 @@ pub type ResolvedContentMap = std::collections::HashMap<String, ResolvedComponen
 /// and renders it.
 pub type SelectorRegistry = std::collections::HashMap<String, String>;
 
+/// Everything the host resolves for ONE source file before compiling it: the project selector registry, the
+/// host-read external `templateUrl`/`styleUrls` content, and the file's library scope. Each part is optional;
+/// all `None` is the project-only, file-local compile (byte-identical to the historical default).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostScope<'a> {
+    pub selectors: Option<&'a SelectorRegistry>,
+    pub resolved: Option<&'a ResolvedContentMap>,
+    pub library: Option<&'a LibraryScope>,
+}
+
+impl HostScope<'_> {
+    /// Whether any part is supplied (so the compile can take the host-aware path).
+    pub fn is_provided(&self) -> bool {
+        self.selectors.is_some_and(|r| !r.is_empty())
+            || self.resolved.is_some_and(|r| !r.is_empty())
+            || self.library.is_some_and(|l| !l.is_empty())
+    }
+}
+
+/// The LIBRARY SCOPE data a host supplies for one source file: what the file's imports bring in from linked
+/// npm packages (directives, components, pipes and NgModules read from their published partial declarations).
+/// The reader that builds it lives in `treaty_ivy::library_scope`; the compiler only consumes these entries, so it
+/// never reads a module itself. See that module for the resolution rules.
+/// Angular's `NgModule` / directive / pipe partial-declaration kinds this module reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LibraryKind {
+    Directive,
+    Component,
+    Pipe,
+    NgModule,
+}
+
+/// A library entity: a class the published package declares as a directive, component, pipe or NgModule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryEntity {
+    pub kind: LibraryKind,
+    /// The class identifier as declared in its defining module (`DecimalPipe`).
+    pub class_name: String,
+    /// The absolute path of the defining module (the file the partial declaration is in).
+    pub module_path: String,
+    /// The CSS selector (directives and components). `None` when the declaration has none.
+    pub selector: Option<String>,
+    /// The pipe's registered name (`number` for `DecimalPipe`).
+    pub pipe_name: Option<String>,
+    /// Whether the entity is standalone (Angular's default when absent).
+    pub is_standalone: bool,
+}
+
+/// One entity brought into a component's scope, under the identifier the emitted `dependencies` array uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeEntry {
+    /// The identifier in the emitted module. For a directly imported name this is the file's binding; for
+    /// an NgModule expansion it is the name the [`ExtraImport`] binds.
+    pub local: String,
+    pub entity: LibraryEntity,
+}
+
+/// An import line the compiled module needs but the source does not have: an NgModule's exported entity
+/// that the file never names (`DefaultValueAccessor` brought in by `FormsModule`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraImport {
+    /// The local binding (`DefaultValueAccessor`, or an alias when the name is taken in the file).
+    pub local: String,
+    /// The name the specifier exports it under.
+    pub imported: String,
+    /// The module specifier: the NgModule's own specifier when its entry exports the class, otherwise the
+    /// absolute path of the defining module.
+    pub specifier: String,
+}
+
+/// The library scope of one source file, keyed by the file-level names its `imports:` arrays use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryScope {
+    /// For each named import binding of the file that resolves to a library declaration: the entities it
+    /// brings into scope. A directive or pipe maps to itself; an NgModule maps to its transitive exports, in
+    /// Angular's order (the NgModule's `exports` order, nested NgModules expanded in place, duplicates dropped).
+    pub by_name: std::collections::HashMap<String, Vec<ScopeEntry>>,
+    /// Import lines the compiled module must add for NgModule-exported entities the file does not import.
+    pub extra_imports: Vec<ExtraImport>,
+    /// Every named import binding of the file that the library resolves to an export of a linked package,
+    /// whatever its kind. A binding that is a plain class (`FormControl`) is here too, with no `by_name`
+    /// entry: the scope proves it is not a directive, so an attribute of the same folded name must not match it.
+    pub resolved_bindings: Vec<String>,
+}
+
+impl LibraryScope {
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// The scope entries of a component whose `imports:` array names `names`, in `imports` order, with a
+    /// later duplicate of the same local identifier dropped (Angular keeps the first occurrence).
+    pub fn entries_for(&self, names: &[String]) -> Vec<ScopeEntry> {
+        let mut out: Vec<ScopeEntry> = Vec::new();
+        for name in names {
+            let Some(entries) = self.by_name.get(name) else { continue };
+            for entry in entries {
+                if !out.iter().any(|e| e.local == entry.local) {
+                    out.push(entry.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
+
 /// OPT-IN compile-time modernizer flags. Every flag defaults to `false`, so
 /// [`ModernizeOptions::default`] (the value carried on every default compile path) leaves the emit
 /// byte-identical to the classic, un-modernized output.
@@ -191,6 +298,10 @@ pub struct CompileCtx<'a> {
     /// the AOT `ɵɵdefineComponent`/`ɵɵdefineDirective`. The DI/pipe family is left as AOT here and
     /// inverted by the existing span-rewrite `partial_emit` pass the caller runs afterwards.
     pub emit_partial_component: bool,
+    /// The file's LIBRARY scope (see [`LibraryScope`]): the directives, components, pipes and NgModule
+    /// expansions its imports bring in from linked npm packages. `None` on every path that supplies none,
+    /// which leaves the emit byte-identical to the project-only resolution.
+    pub library: Option<&'a LibraryScope>,
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled

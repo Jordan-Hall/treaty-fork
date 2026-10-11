@@ -55,11 +55,27 @@ pub fn compile_source_with_registry(
     file_name: &str,
     registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
 ) -> CompileOutput {
+    compile_source_with_host_scope(
+        source,
+        file_name,
+        treaty_ivy::source_compile::HostScope {
+            selectors: registry,
+            ..Default::default()
+        },
+    )
+}
+
+/// Like [`compile_source_with_registry`] but with the file's full host-resolved scope: the project selector
+/// registry, host-read external `templateUrl`/`styleUrls` content, and the library scope of its imports.
+pub fn compile_source_with_host_scope(
+    source: &str,
+    file_name: &str,
+    host: treaty_ivy::source_compile::HostScope<'_>,
+) -> CompileOutput {
     let input = Path::new(file_name).to_path_buf();
     match frontend_for(file_name) {
         Frontend::Authoring => {
-            let compiled =
-                rust_authoring::authoring::compile_file_with_registry(source, file_name, registry);
+            let compiled = rust_authoring::authoring::compile_file_with_host_scope(source, file_name, host);
             CompileOutput {
                 input,
                 code: compiled.code,

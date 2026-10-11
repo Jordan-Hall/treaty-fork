@@ -315,15 +315,25 @@ fn lower_top_level_item(
 /// `type`-only specifiers), mirroring the oxc backend's `collect_imports_in_stmt`.
 fn collect_import(import: &swc_ecma_ast::ImportDecl, out: &mut Vec<ImportInfo>) {
     let type_only_decl = import.type_only;
+    let source = wtf8_to_string(&import.src.value);
     for spec in &import.specifiers {
-        let (local, inline_type) = match spec {
-            ImportSpecifier::Named(s) => (s.local.sym.to_string(), s.is_type_only),
-            ImportSpecifier::Default(s) => (s.local.sym.to_string(), false),
-            ImportSpecifier::Namespace(s) => (s.local.sym.to_string(), false),
+        let (local, inline_type, imported) = match spec {
+            ImportSpecifier::Named(s) => {
+                let imported = match &s.imported {
+                    Some(swc_ecma_ast::ModuleExportName::Ident(id)) => id.sym.to_string(),
+                    Some(swc_ecma_ast::ModuleExportName::Str(st)) => wtf8_to_string(&st.value),
+                    None => s.local.sym.to_string(),
+                };
+                (s.local.sym.to_string(), s.is_type_only, imported)
+            }
+            ImportSpecifier::Default(s) => (s.local.sym.to_string(), false, "default".to_string()),
+            ImportSpecifier::Namespace(s) => (s.local.sym.to_string(), false, "*".to_string()),
         };
         out.push(ImportInfo {
             local_name: local,
             type_only: type_only_decl || inline_type,
+            source: source.clone(),
+            imported,
         });
     }
 }

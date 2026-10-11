@@ -247,6 +247,28 @@ pub fn resolve_template_dependencies(
     candidate_names: &[String],
     nodes: &[crate::template::r3_ast::Node],
 ) -> Vec<R3TemplateDependencyMetadata> {
+    resolve_template_dependencies_scoped(candidate_names, candidate_names, nodes)
+}
+
+/// The two PascalCase fold maps the template usage walk consults: element TAGS (`<greetingCard>` → the
+/// `GreetingCard` candidate) and attribute / input / output NAMES (`[routerLink]` → the `RouterLink` candidate).
+struct FoldMaps<'a> {
+    tags: &'a std::collections::HashMap<String, &'a str>,
+    attrs: &'a std::collections::HashMap<String, &'a str>,
+}
+
+/// [`resolve_template_dependencies`] with the ATTRIBUTE-name fold restricted to `attribute_fold_names`.
+///
+/// A candidate whose selector the host already knows (a library directive, matched through the selector
+/// matcher) or that the library scope proved is NOT a directive (a plain class such as `FormControl`, which
+/// the `formControl` attribute must not match) is left out of `attribute_fold_names`. The selectorless
+/// `<Foo>` tag match and the tag fold still see every candidate, since a selectorless reference names the
+/// class directly.
+pub fn resolve_template_dependencies_scoped(
+    candidate_names: &[String],
+    attribute_fold_names: &[String],
+    nodes: &[crate::template::r3_ast::Node],
+) -> Vec<R3TemplateDependencyMetadata> {
     use crate::binder::{
         DirectiveMatcher, DirectiveMeta, R3TargetBinder, SelectorlessMatcher, Target,
     };
@@ -295,7 +317,16 @@ pub fn resolve_template_dependencies(
         .iter()
         .map(|n| (tag_to_pascal_case(n), n.as_str()))
         .collect();
-    collect_element_tag_usages(nodes, &candidate_by_pascal, &mut used);
+    let attribute_by_pascal: std::collections::HashMap<String, &str> = ordered
+        .iter()
+        .filter(|n| attribute_fold_names.contains(n))
+        .map(|n| (tag_to_pascal_case(n), n.as_str()))
+        .collect();
+    let folds = FoldMaps {
+        tags: &candidate_by_pascal,
+        attrs: &attribute_by_pascal,
+    };
+    collect_element_tag_usages(nodes, &folds, &mut used);
 
     // Emit one dependency per matched candidate, in candidate (import) order.
     ordered
@@ -312,7 +343,7 @@ pub fn resolve_template_dependencies(
 /// candidate class-name set. Mirrors the selectorless match for kebab/camel-spelled usages.
 fn collect_element_tag_usages(
     nodes: &[crate::template::r3_ast::Node],
-    candidates: &std::collections::HashMap<String, &str>,
+    candidates: &FoldMaps<'_>,
     used: &mut std::collections::HashSet<String>,
 ) {
     use crate::template::r3_ast::Node;
@@ -328,7 +359,7 @@ fn collect_element_tag_usages(
                     el.name.contains('-') || el.name.chars().any(|c| c.is_ascii_uppercase());
                 if is_custom_tag {
                     let pascal = tag_to_pascal_case(&el.name);
-                    if let Some(orig) = candidates.get(&pascal) {
+                    if let Some(orig) = candidates.tags.get(&pascal) {
                         used.insert((*orig).to_string());
                     }
                 }
@@ -342,17 +373,17 @@ fn collect_element_tag_usages(
                 // convention `RouterLink → [routerLink]` holds for every attribute-selector directive).
                 collect_attr_name_usages(
                     el.attributes.iter().map(|a| a.name.as_str()),
-                    candidates,
+                    candidates.attrs,
                     used,
                 );
                 collect_attr_name_usages(
                     el.inputs.iter().map(|i| i.name.as_str()),
-                    candidates,
+                    candidates.attrs,
                     used,
                 );
                 collect_attr_name_usages(
                     el.outputs.iter().map(|o| o.name.as_str()),
-                    candidates,
+                    candidates.attrs,
                     used,
                 );
                 collect_element_tag_usages(&el.children, candidates, used);
@@ -362,17 +393,17 @@ fn collect_element_tag_usages(
                 // Structural-directive / `ng-template` attribute usages match the same way.
                 collect_attr_name_usages(
                     t.attributes.iter().map(|a| a.name.as_str()),
-                    candidates,
+                    candidates.attrs,
                     used,
                 );
                 collect_attr_name_usages(
                     t.inputs.iter().map(|i| i.name.as_str()),
-                    candidates,
+                    candidates.attrs,
                     used,
                 );
                 collect_attr_name_usages(
                     t.outputs.iter().map(|o| o.name.as_str()),
-                    candidates,
+                    candidates.attrs,
                     used,
                 );
                 for ta in &t.template_attrs {
@@ -380,7 +411,7 @@ fn collect_element_tag_usages(
                         crate::template::r3_ast::TemplateAttr::Bound(b) => b.name.as_str(),
                         crate::template::r3_ast::TemplateAttr::Text(tx) => tx.name.as_str(),
                     };
-                    collect_attr_name_usages(std::iter::once(name), candidates, used);
+                    collect_attr_name_usages(std::iter::once(name), candidates.attrs, used);
                 }
                 collect_element_tag_usages(&t.children, candidates, used);
             }
@@ -928,6 +959,7 @@ pub fn compile_component_with(
         // be resolved here; the source-driven `compile_component_meta` path threads the real
         // `imports` for pipe-dependency resolution.
         imported_directive_names: Vec::new(),
+        library_pipes: Vec::new(),
     };
 
     // 4. Assemble the definition (real template builder + stub host bindings).

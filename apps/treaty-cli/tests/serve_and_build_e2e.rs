@@ -321,6 +321,7 @@ fn native_build_emits_a_self_contained_bootable_esm_dist() {
         root: dir.clone(),
         entry: dir.join("src").join("main.ts"),
         out_dir: out_dir.clone(),
+        format: treaty_cli::bundle::OutputFormat::Modules,
     })
     .expect("native build ok");
 

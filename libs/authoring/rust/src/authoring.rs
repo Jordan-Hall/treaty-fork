@@ -207,6 +207,21 @@ pub fn compile_file_with_registry(
     compile_file(source, file_name)
 }
 
+/// Like [`compile_file_with_registry`] but with the file's full host-resolved scope (project selectors,
+/// external template and style content, and the library scope of its imports). Only the Authoring `.ts`
+/// (base-Angular) front-end consumes it; every other input routes as [`compile_file`] does.
+pub fn compile_file_with_host_scope(
+    source: &str,
+    file_name: &str,
+    host: treaty_ivy::source_compile::HostScope<'_>,
+) -> CompiledAuthoring {
+    let is_angular_ts = extension_of(file_name).as_deref() == Some("ts");
+    if is_angular_ts && host.is_provided() {
+        return crate::angular_source::compile_angular_source_with_host_scope(source, file_name, host);
+    }
+    compile_file(source, file_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

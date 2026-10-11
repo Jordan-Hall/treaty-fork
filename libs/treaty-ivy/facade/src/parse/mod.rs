@@ -89,6 +89,11 @@ pub struct ImportInfo {
     pub local_name: String,
     /// Whether this binding is type-only (whole-declaration `import type` or inline `{ type Foo }`).
     pub type_only: bool,
+    /// The module specifier the binding is imported from (`'@angular/common'`, `'./dep'`), unquoted.
+    pub source: String,
+    /// The name the module exports (`Foo` for `import { Foo as Bar }`), `"default"` for a default
+    /// import and `"*"` for a namespace import.
+    pub imported: String,
 }
 
 /// A pre-lowered `ɵɵngDeclare*({…})` call discovered in a partial-declaration module: which kind of

@@ -39,6 +39,14 @@ use crate::template::r3_ast as t;
 use crate::util::{ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference};
 use crate::view::template::chain_statements;
 
+/// `sanitizeIdentifier` (`parse_util.ts`) applied to a generated handler name: every char outside
+/// `[A-Za-z0-9_]` becomes `_`. Angular's `naming.ts` applies it to host listener names too.
+fn sanitize_handler_identifier(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
 /// A tiny insertion-ordered map (stand-in for `indexmap::IndexMap`, which is not a workspace
 /// dependency). Iteration / serialization order is the insertion order — this is golden-observable
 /// for `inputs`/`outputs`/`host.*`, so order preservation is required (spec §3.12 / §7).
@@ -807,6 +815,11 @@ pub struct R3ComponentMetadata<D: R3TemplateDependency> {
     /// against the pipe name (`percent01` → `Percent01Pipe` / `Percent01`). Empty for the
     /// NgModule-scoped (non-standalone) path, which resolves pipes from module scope instead.
     pub imported_directive_names: Vec<String>,
+    /// The LIBRARY pipes this component's scope brings in, in scope order: `(pipe name, class identifier)`
+    /// (`("number", "DecimalPipe")`). A template pipe is resolved through it by its registered NAME, so a
+    /// library pipe whose class name does not fold to its name (`UpperCasePipe` for `uppercase`) is still
+    /// listed in `dependencies` (TREATY-ISSUES T3). Empty when the host supplied no library scope.
+    pub library_pipes: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,8 +1396,12 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
                 continue;
             }
 
-            // `naming.ts`: `${name}_${event}_HostBindingHandler`.
-            let handler_name = format!("{name}_{}_HostBindingHandler", event.replace('.', "_"));
+            // `naming.ts`: `${name}_${event}_HostBindingHandler`, then `sanitizeIdentifier` on the whole
+            // name (`window:resize` / `keydown.enter` must not reach the identifier unchanged).
+            let handler_name = sanitize_handler_identifier(&format!(
+                "{name}_{}_HostBindingHandler",
+                event.replace('.', "_")
+            ));
             let handler_fn = o::fn_(params, body, None, Some(handler_name));
             create_stmts.push(host_instruction(
                 R3::Listener,
@@ -2138,7 +2155,11 @@ where
     //   * A NgModule-declared (NON-standalone) component draws its scope from its declaring module,
     //     so a template pipe `name` resolves to its co-declared class via the name→class convention.
     let pipe_deps = if meta.base.is_standalone {
-        resolve_standalone_pipe_dependencies(&meta.template.nodes, &meta.imported_directive_names)
+        resolve_standalone_pipe_dependencies(
+            &meta.template.nodes,
+            &meta.imported_directive_names,
+            &meta.library_pipes,
+        )
     } else {
         collect_template_pipe_dependencies(&meta.template.nodes)
     };
@@ -2542,12 +2563,27 @@ fn collect_template_pipe_dependencies(nodes: &[t::Node]) -> Vec<Expr> {
 /// template error in Angular, not a synthesized dependency). Resolution is in first-use order to
 /// match the directive-declaration ordering of the `dependencies` array, and each imported class is
 /// listed at most once even if its pipe is used several times.
-fn resolve_standalone_pipe_dependencies(nodes: &[t::Node], imported_names: &[String]) -> Vec<Expr> {
+fn resolve_standalone_pipe_dependencies(
+    nodes: &[t::Node],
+    imported_names: &[String],
+    library_pipes: &[(String, String)],
+) -> Vec<Expr> {
     let mut collector = PipeNameCollector::default();
     collect_pipes_in_nodes(nodes, &mut collector);
     let mut out: Vec<Expr> = Vec::new();
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A LIBRARY pipe is resolved from the host's scope by its registered name, in scope order (Angular
+    // lists a component's pipes in the order its scope brings them in). The name-shape rule below is kept
+    // only for names the library scope does not provide, i.e. project-local pipes.
+    for (pipe_name, class) in library_pipes {
+        if collector.names.iter().any(|used_name| used_name == pipe_name) && used.insert(class.clone()) {
+            out.push(o::variable(class, None));
+        }
+    }
     for name in &collector.names {
+        if library_pipes.iter().any(|(pipe_name, _)| pipe_name == name) {
+            continue;
+        }
         if let Some(class) = resolve_pipe_name_to_import(name, imported_names) {
             if used.insert(class.clone()) {
                 out.push(o::variable(&class, None));
@@ -2949,6 +2985,7 @@ mod tests {
             raw_imports: None,
             foreign_imports: None,
             imported_directive_names: Vec::new(),
+            library_pipes: Vec::new(),
         }
     }
 
@@ -3442,6 +3479,34 @@ mod tests {
             stmts.contains("(ctx, view) => (a, b) => a / b + ctx.componentProp"),
             "factory body wrong: {stmts}"
         );
+    }
+
+    #[test]
+    fn host_listener_handler_names_are_sanitized_identifiers() {
+        // Angular `naming.ts` sanitises the composed handler name, so a target-prefixed event
+        // (`window:resize`) or a dotted key event (`keydown.enter`) yields a valid identifier. The
+        // listener's event NAME argument stays verbatim (TREATY-ISSUES T7/T8).
+        let mut meta = directive_meta("TestDir", "[d]");
+        meta.host
+            .listeners
+            .insert("window:resize".to_string(), "onResize()".to_string());
+        meta.host
+            .listeners
+            .insert("keydown.enter".to_string(), "submit()".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+
+        assert!(
+            js.contains("function TestDir_window_resize_HostBindingHandler()"),
+            "window:resize handler name not sanitized: {js}"
+        );
+        assert!(
+            js.contains("function TestDir_keydown_enter_HostBindingHandler()"),
+            "keydown.enter handler name not sanitized: {js}"
+        );
+        assert!(js.contains("\"window:resize\""), "event name must stay verbatim: {js}");
+        assert!(!js.contains(":resize_"), "raw colon leaked into an identifier: {js}");
     }
 
     #[test]

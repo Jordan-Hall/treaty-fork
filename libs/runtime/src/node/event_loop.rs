@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use nova_vm::ecmascript::{Agent, Job, JsResult};
@@ -63,7 +64,6 @@ impl TimerEntry {
 ///
 /// Owned by [`crate::node::core::HostState`]; its [`nova_vm::ecmascript::HostHooks`] impl forwards
 /// the three `enqueue_*` hooks here.
-#[derive(Default)]
 pub(crate) struct EventLoop {
     /// Promise reaction / resolve-thenable jobs. Drained FIFO, run-to-completion, before any timer.
     microtasks: RefCell<VecDeque<Job>>,
@@ -73,6 +73,21 @@ pub(crate) struct EventLoop {
     timers: RefCell<BinaryHeap<Reverse<TimerEntry>>>,
     /// Monotonic timer sequence counter for stable FIFO tie-breaking.
     next_seq: RefCell<u64>,
+    /// The time source for timer deadlines and due checks. The default reads the monotonic clock; an
+    /// embedder may inject its own (for example virtual time in tests). See [`EventLoop::set_clock`].
+    clock: RefCell<Rc<dyn Fn() -> Instant>>,
+}
+
+impl Default for EventLoop {
+    fn default() -> Self {
+        EventLoop {
+            microtasks: RefCell::default(),
+            macrotasks: RefCell::default(),
+            timers: RefCell::default(),
+            next_seq: RefCell::default(),
+            clock: RefCell::new(Rc::new(Instant::now)),
+        }
+    }
 }
 
 impl std::fmt::Debug for EventLoop {
@@ -101,10 +116,26 @@ impl EventLoop {
         self.macrotasks.borrow_mut().push(job);
     }
 
+    /// The loop's current time (the injected clock, or the monotonic clock by default).
+    pub(crate) fn now(&self) -> Instant {
+        (self.clock.borrow())()
+    }
+
+    /// Replace the time source. Timer deadlines are measured from, and due timers are tested against, this
+    /// clock from now on. Timers already scheduled keep their absolute deadlines.
+    pub(crate) fn set_clock(&self, clock: Rc<dyn Fn() -> Instant>) {
+        *self.clock.borrow_mut() = clock;
+    }
+
+    /// The deadline of the nearest pending timer, if any.
+    pub(crate) fn next_timer_deadline(&self) -> Option<Instant> {
+        self.timers.borrow().peek().map(|Reverse(entry)| entry.deadline)
+    }
+
     /// Enqueue a timeout job to run after at least `milliseconds`. Forwarded from
     /// `HostHooks::enqueue_timeout_job`.
     pub(crate) fn enqueue_timeout(&self, job: Job, milliseconds: u64) {
-        let deadline = Instant::now() + Duration::from_millis(milliseconds);
+        let deadline = self.now() + Duration::from_millis(milliseconds);
         let seq = {
             let mut s = self.next_seq.borrow_mut();
             let v = *s;
@@ -194,7 +225,7 @@ pub(crate) fn run_until_idle<'gc>(
 
         // 3. Otherwise advance timers. Run a due one immediately; sleep to the nearest pending one
         //    (bounded by `deadline`) since no microtask/macrotask is currently runnable.
-        match event_loop.pop_due_timer(Instant::now()) {
+        match event_loop.pop_due_timer(event_loop.now()) {
             TimerPoll::Due(job) => {
                 job.run(agent, gc.reborrow()).unbind()?.bind(gc.nogc());
             }
@@ -203,7 +234,7 @@ pub(crate) fn run_until_idle<'gc>(
                     return Ok(());
                 }
                 let until = sleep_until(deadline, when);
-                let now = Instant::now();
+                let now = event_loop.now();
                 if until > now {
                     std::thread::sleep(until - now);
                 }
@@ -212,6 +243,41 @@ pub(crate) fn run_until_idle<'gc>(
                 }
             }
             TimerPoll::Empty => return Ok(()),
+        }
+    }
+}
+
+/// Run every job that is runnable NOW, and return without sleeping: microtasks first, then generic jobs,
+/// then the timers whose deadline the loop's clock has reached. A timer that is not yet due is left in the
+/// queue (its deadline is what [`EventLoop::next_timer_deadline`] reports). Unlike [`run_until_idle`] this
+/// never blocks, so an embedder can drive the loop from its own scheduler.
+///
+/// The first job that throws aborts the pump and its error is returned, as in [`run_until_idle`].
+///
+/// `jobs_run` counts the jobs that ran, including those run before an error.
+pub(crate) fn pump_ready<'gc>(
+    agent: &mut Agent,
+    event_loop: &EventLoop,
+    jobs_run: &mut usize,
+    mut gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, ()> {
+    loop {
+        if let Some(job) = event_loop.pop_microtask() {
+            job.run(agent, gc.reborrow()).unbind()?.bind(gc.nogc());
+            *jobs_run += 1;
+            continue;
+        }
+        if let Some(job) = event_loop.pop_macrotask() {
+            job.run(agent, gc.reborrow()).unbind()?.bind(gc.nogc());
+            *jobs_run += 1;
+            continue;
+        }
+        match event_loop.pop_due_timer(event_loop.now()) {
+            TimerPoll::Due(job) => {
+                job.run(agent, gc.reborrow()).unbind()?.bind(gc.nogc());
+                *jobs_run += 1;
+            }
+            TimerPoll::Pending(_) | TimerPoll::Empty => return Ok(()),
         }
     }
 }

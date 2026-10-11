@@ -82,6 +82,15 @@ pub fn compile_to_ivy_ts_with_registry(
     compile::compile_source_with_registry(source, file_name, registry)
 }
 
+/// Like [`compile_to_ivy_ts_with_registry`] with the file's full host-resolved scope.
+pub fn compile_to_ivy_ts_with_host_scope(
+    source: &str,
+    file_name: &str,
+    host: treaty_ivy::source_compile::HostScope<'_>,
+) -> CompileOutput {
+    compile::compile_source_with_host_scope(source, file_name, host)
+}
+
 /// Whether a file name carries a TypeScript/JSX-ish extension the type-stripper
 /// should treat as TypeScript (so `oxc` parses TS syntax and the transformer
 /// removes it). Plain `.js`/`.mjs` are returned as-is.
@@ -288,7 +297,7 @@ fn strip_types_inner(
 /// the build/native paths and for dev with maps disabled. Use [`lower_with_map`]
 /// to additionally emit the composed dev source map.
 pub fn lower(source: &str, file_name: &str) -> LoweredModule {
-    lower_full(source, file_name, None, false)
+    lower_full(source, file_name, Default::default(), false)
 }
 
 /// Like [`lower`] but ALSO building the composed dev Source Map v3
@@ -296,7 +305,7 @@ pub fn lower(source: &str, file_name: &str) -> LoweredModule {
 ///
 /// The emitted `code` is byte-identical to [`lower`]; only `map` is added.
 pub fn lower_with_map(source: &str, file_name: &str) -> LoweredModule {
-    lower_full(source, file_name, None, true)
+    lower_full(source, file_name, Default::default(), true)
 }
 
 /// Like [`lower`] but threading the project's CROSS-MODULE selector registry for THIS file, so an
@@ -307,7 +316,35 @@ pub fn lower_with_registry(
     file_name: &str,
     registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
 ) -> LoweredModule {
-    lower_full(source, file_name, registry, false)
+    lower_full(
+        source,
+        file_name,
+        treaty_ivy::source_compile::HostScope {
+            selectors: registry,
+            ..Default::default()
+        },
+        false,
+    )
+}
+
+/// Like [`lower_with_host_scope`] but also composing the dev source map (what `lower_with_map` does for a file
+/// without a host scope). The emitted `code` is identical to [`lower_with_host_scope`].
+pub fn lower_with_host_scope_and_map(
+    source: &str,
+    file_name: &str,
+    host: treaty_ivy::source_compile::HostScope<'_>,
+) -> LoweredModule {
+    lower_full(source, file_name, host, true)
+}
+
+/// Like [`lower_with_registry`] with the file's full host-resolved scope (selectors, external template and
+/// style content, library scope). `HostScope::default()` is byte-identical to [`lower`].
+pub fn lower_with_host_scope(
+    source: &str,
+    file_name: &str,
+    host: treaty_ivy::source_compile::HostScope<'_>,
+) -> LoweredModule {
+    lower_full(source, file_name, host, false)
 }
 
 /// The shared lowering core: Ivy-lower (optionally with a selector registry),
@@ -316,10 +353,10 @@ pub fn lower_with_registry(
 pub fn lower_full(
     source: &str,
     file_name: &str,
-    registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
+    host: treaty_ivy::source_compile::HostScope<'_>,
     want_map: bool,
 ) -> LoweredModule {
-    let compiled = compile_to_ivy_ts_with_registry(source, file_name, registry);
+    let compiled = compile_to_ivy_ts_with_host_scope(source, file_name, host);
     if !compiled.is_ok() {
         return LoweredModule {
             code: String::new(),

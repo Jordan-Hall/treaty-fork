@@ -288,18 +288,28 @@ fn collect_imports_in_stmt(stmt: &Statement, out: &mut Vec<ImportInfo>) {
     let Some(specifiers) = &import.specifiers else {
         return;
     };
+    let source = import.source.value.to_string();
     for spec in specifiers {
-        use oxc_ast::ast::ImportDeclarationSpecifier as Spec;
-        let (local, inline_type) = match spec {
+        use oxc_ast::ast::{ImportDeclarationSpecifier as Spec, ModuleExportName};
+        let (local, inline_type, imported) = match spec {
             Spec::ImportSpecifier(s) => {
-                (s.local.name.to_string(), s.import_kind == ImportOrExportKind::Type)
+                let imported = match &s.imported {
+                    ModuleExportName::IdentifierName(n) => n.name.to_string(),
+                    ModuleExportName::IdentifierReference(n) => n.name.to_string(),
+                    ModuleExportName::StringLiteral(n) => n.value.to_string(),
+                };
+                (s.local.name.to_string(), s.import_kind == ImportOrExportKind::Type, imported)
             }
-            Spec::ImportDefaultSpecifier(s) => (s.local.name.to_string(), false),
-            Spec::ImportNamespaceSpecifier(s) => (s.local.name.to_string(), false),
+            Spec::ImportDefaultSpecifier(s) => {
+                (s.local.name.to_string(), false, "default".to_string())
+            }
+            Spec::ImportNamespaceSpecifier(s) => (s.local.name.to_string(), false, "*".to_string()),
         };
         out.push(ImportInfo {
             local_name: local,
             type_only: type_only_decl || inline_type,
+            source: source.clone(),
+            imported,
         });
     }
 }

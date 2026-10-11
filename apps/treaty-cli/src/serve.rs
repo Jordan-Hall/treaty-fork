@@ -71,7 +71,10 @@ use tokio::sync::broadcast;
 
 use crate::resolve::{is_under_node_modules, ModuleResolver};
 use crate::source_map::append_inline;
-use crate::transform::{lower, lower_with_map, rewrite_imports};
+use crate::host_scope::{host_for_file, FsModuleLoader};
+use crate::transform::{lower_with_host_scope, lower_with_host_scope_and_map, rewrite_imports};
+use treaty_ivy::library_scope::LibraryIndex;
+use treaty_ivy::source_compile::HostScope;
 
 /// Options for a dev session.
 #[derive(Debug, Clone)]
@@ -153,6 +156,9 @@ struct CachedModule {
     /// FNV-1a hash of `body`. Stable across rebuilds that produce identical
     /// output (a save with no content change → no HMR churn).
     content_hash: u64,
+    /// The external files (`templateUrl`, `styleUrl(s)`) the module was compiled from, with their mtimes at
+    /// build time. A change to any of them makes the cached module stale (TREATY-ISSUES T1).
+    input_mtimes: Vec<(PathBuf, Option<SystemTime>)>,
 }
 
 /// Shared server state (compile cache, resolver, reload channel, config).
@@ -234,12 +240,22 @@ fn build_module(state: &ServerState, abs: &Path) -> Result<CachedModule, String>
 
     if is_authoring_source(abs) {
         // First-party authoring/TS: Ivy-lower + type-strip, then rewrite imports.
-        // With source maps ON, lower WITH the composed `stripped -> original` map
-        // and append it inline; OFF stays on the fast no-map path (identical code).
+        // The host supplies what the compile reads from disk: the library scope of the file's imports (read
+        // from the linked packages, as the native build does) and its external `templateUrl`/stylesheet
+        // contents. With source maps ON, lower WITH the composed `stripped -> original` map and append it
+        // inline; OFF stays on the fast no-map path (identical code).
+        let index = LibraryIndex::new();
+        let loader = FsModuleLoader::new();
+        let host = host_for_file(&source, abs, &index, &loader)?;
+        let scope = HostScope {
+            selectors: None,
+            resolved: Some(&host.resolved),
+            library: Some(&host.library),
+        };
         let lowered = if state.source_maps {
-            lower_with_map(&source, &abs.to_string_lossy())
+            lower_with_host_scope_and_map(&source, &abs.to_string_lossy(), scope)
         } else {
-            lower(&source, &abs.to_string_lossy())
+            lower_with_host_scope(&source, &abs.to_string_lossy(), scope)
         };
         if !lowered.errors.is_empty() {
             return Err(lowered.errors.join("; "));
@@ -254,7 +270,9 @@ fn build_module(state: &ServerState, abs: &Path) -> Result<CachedModule, String>
                 body = append_inline(&body, &data_url);
             }
         }
-        return Ok(finish_module(body, mtime(abs)));
+        let mut module = finish_module(body, mtime(abs));
+        module.input_mtimes = host.inputs.iter().map(|p| (p.clone(), mtime(p))).collect();
+        return Ok(module);
     }
 
     // A published module (`node_modules`): if it is a *partial* Angular library
@@ -291,6 +309,7 @@ fn finish_module(body: String, built_from_mtime: Option<SystemTime>) -> CachedMo
         content_type: "application/javascript; charset=utf-8",
         built_from_mtime,
         content_hash,
+        input_mtimes: Vec::new(),
     }
 }
 
@@ -446,7 +465,8 @@ async fn handle_fs(
     // Cache hit if the file's mtime is unchanged since we built it.
     let current = mtime(&abs);
     if let Some(hit) = state.cache.lock().unwrap().get(&abs) {
-        if hit.built_from_mtime == current {
+        let inputs_unchanged = hit.input_mtimes.iter().all(|(p, m)| mtime(p) == *m);
+        if hit.built_from_mtime == current && inputs_unchanged {
             return module_response(hit);
         }
     }
@@ -804,6 +824,27 @@ mod tests {
         assert!(!module.body.contains(": number"), "type survived: {}", module.body);
         // The relative `./dep` import was rewritten to a served /@fs/ URL.
         assert!(module.body.contains("/@fs/"), "relative import not rewritten: {}", module.body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1 in the dev server: a `templateUrl` is read relative to the component and the cached module records the
+    /// file, so an edit to the template makes the module stale (the handler compares the recorded mtimes).
+    #[test]
+    fn build_module_reads_template_url_and_tracks_it_as_an_input() {
+        let dir = std::env::temp_dir().join(format!("treaty-serve-tpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("card.html"), "<p>first</p>").unwrap();
+        let comp = "import { Component } from '@angular/core';\n@Component({ selector: 'a-card', templateUrl: './card.html' })\nexport class Card {}";
+        let comp_path = dir.join("card.ts");
+        std::fs::write(&comp_path, comp).unwrap();
+
+        let state = state_for(&dir);
+        let module = build_module(&state, &comp_path).expect("build_module ok");
+        assert!(module.body.contains("first"), "template file not compiled in: {}", module.body);
+        assert_eq!(module.input_mtimes.len(), 1, "the template is a tracked input");
+        assert_eq!(module.input_mtimes[0].0, dir.join("./card.html"));
+        assert!(module.input_mtimes[0].1.is_some(), "the input's mtime was recorded");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

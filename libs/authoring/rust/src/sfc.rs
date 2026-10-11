@@ -1335,6 +1335,7 @@ fn compile_from_parts_inner(
         // The `.treaty` JS chunk's imported identifiers, so a standalone SFC that pipes through an
         // imported pipe (`value | percent01`) lists that pipe class in `dependencies`.
         imported_directive_names: candidates.clone(),
+        library_pipes: Vec::new(),
     };
 
     // 4. Emit the definition.
@@ -1698,7 +1699,7 @@ mod tests {
         );
         // ɵcmp = the ɵɵdefineComponent expression.
         assert!(
-            code.contains(&format!("Greeting.\u{0275}cmp = i0.{DEFINE}")),
+            code.contains(&format!("Greeting.\u{0275}cmp = /*@__PURE__*/ i0.{DEFINE}")),
             "no ɵcmp = defineComponent; got: {code}"
         );
         // export default.

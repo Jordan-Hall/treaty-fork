@@ -452,36 +452,36 @@ mod tests {
 
     #[test]
     fn clones_map_and_set_deeply() {
-        let mapScript = "var m = new Map([['k', { n: 1 }]]);\
+        let map_script = "var m = new Map([['k', { n: 1 }]]);\
              var c = structuredClone(m);\
              c.get('k').n = 2;\
              [c instanceof Map, c !== m, c.size === 1, m.get('k').n === 1, c.get('k').n === 2]\
                .join(',')";
-        assert_eq!(eval_with_clone(mapScript), "true,true,true,true,true");
+        assert_eq!(eval_with_clone(map_script), "true,true,true,true,true");
 
-        let setScript = "var s = new Set([1, 2, 3]);\
+        let set_script = "var s = new Set([1, 2, 3]);\
              var c = structuredClone(s);\
              [c instanceof Set, c !== s, c.size === 3, c.has(2)].join(',')";
-        assert_eq!(eval_with_clone(setScript), "true,true,true,true");
+        assert_eq!(eval_with_clone(set_script), "true,true,true,true");
     }
 
     #[test]
     fn clones_array_buffer_and_typed_arrays() {
         // ArrayBuffer is byte-copied; the underlying bytes match but the buffer is distinct.
-        let abScript = "var ab = new Uint8Array([1,2,3,4]).buffer;\
+        let ab_script = "var ab = new Uint8Array([1,2,3,4]).buffer;\
              var c = structuredClone(ab);\
              var src = new Uint8Array(ab), dst = new Uint8Array(c);\
              [c instanceof ArrayBuffer, c !== ab, c.byteLength === 4, dst[0] === 1, dst[3] === 4]\
                .join(',')";
-        assert_eq!(eval_with_clone(abScript), "true,true,true,true,true");
+        assert_eq!(eval_with_clone(ab_script), "true,true,true,true,true");
 
         // Typed array is cloned over a cloned buffer; mutation does not write back to the source.
-        let taScript = "var ta = new Uint16Array([10, 20, 30]);\
+        let ta_script = "var ta = new Uint16Array([10, 20, 30]);\
              var c = structuredClone(ta);\
              c[0] = 999;\
              [c instanceof Uint16Array, c.length === 3, ta[0] === 10, c[0] === 999, c[2] === 30]\
                .join(',')";
-        assert_eq!(eval_with_clone(taScript), "true,true,true,true,true");
+        assert_eq!(eval_with_clone(ta_script), "true,true,true,true,true");
     }
 
     #[test]
@@ -496,19 +496,19 @@ mod tests {
     #[test]
     fn throws_data_clone_error_for_functions_and_symbols() {
         // A function is not cloneable: the call throws a DataCloneError.
-        let fnScript = "var ok = false; try { structuredClone(function () {}); } \
+        let fn_script = "var ok = false; try { structuredClone(function () {}); } \
              catch (e) { ok = e.name === 'DataCloneError'; } ok.toString()";
-        assert_eq!(eval_with_clone(fnScript), "true");
+        assert_eq!(eval_with_clone(fn_script), "true");
 
         // A symbol value is not cloneable.
-        let symScript = "var ok = false; try { structuredClone(Symbol('s')); } \
+        let sym_script = "var ok = false; try { structuredClone(Symbol('s')); } \
              catch (e) { ok = e.name === 'DataCloneError'; } ok.toString()";
-        assert_eq!(eval_with_clone(symScript), "true");
+        assert_eq!(eval_with_clone(sym_script), "true");
 
         // A function nested inside an object also triggers the error.
-        let nestedScript = "var ok = false; try { structuredClone({ f: function () {} }); } \
+        let nested_script = "var ok = false; try { structuredClone({ f: function () {} }); } \
              catch (e) { ok = e.name === 'DataCloneError'; } ok.toString()";
-        assert_eq!(eval_with_clone(nestedScript), "true");
+        assert_eq!(eval_with_clone(nested_script), "true");
     }
 
     #[test]

@@ -1512,6 +1512,7 @@ mod tests {
             agent,
             realm,
             host_state,
+            ..
         } = &mut rt;
         // Borrow the HostState separately from the agent (the decoupled borrow the module path needs).
         let host: &HostState = host_state

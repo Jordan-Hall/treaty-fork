@@ -35,8 +35,10 @@ use crate::parse::{
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
 use crate::decorators::registry::{
-    AngularDecoratorKind, ClassMeta, CompileCtx, DecoratorCompiler, DecoratorRegistry,
+    AngularDecoratorKind, ClassMeta, CompileCtx, DecoratorCompiler, DecoratorRegistry, ExtraImport,
+    LibraryKind, LibraryScope, ScopeEntry,
 };
+pub use crate::decorators::registry::HostScope;
 use crate::factory::{
     compile_factory_function, compile_injectable, FactoryDeps, FactoryTarget, ForwardRefHandling,
     MaybeForwardRef, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryMetadata,
@@ -1575,6 +1577,7 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
             None,
             false,
             ClassShape::Assignments,
+            None,
         )
     })
 }
@@ -1656,6 +1659,7 @@ pub fn compile_component_source_with_options(
             None,
             options.emit_partial_component,
             options.class_shape,
+            None,
         )
     })
 }
@@ -1689,6 +1693,7 @@ pub fn compile_component_source_with_resolved(
             None,
             false,
             ClassShape::Assignments,
+            None,
         )
     })
 }
@@ -1722,6 +1727,7 @@ pub fn compile_component_source_with_options_and_resolved(
             None,
             options.emit_partial_component,
             options.class_shape,
+            None,
         )
     })
 }
@@ -1781,7 +1787,7 @@ pub fn compile_component_source_with_map_and_selector(
     source_name: &str,
     default_selector: Option<&str>,
 ) -> CompiledComponentWithMap {
-    compile_component_source_full(ts_source, file_name, source_name, default_selector, None, None)
+    compile_component_source_full(ts_source, file_name, source_name, default_selector, None, None, None)
 }
 
 /// Like [`compile_component_source_with_map_and_selector`] but ALSO supplying the
@@ -1808,6 +1814,7 @@ pub fn compile_component_source_with_map_selector_and_resolved(
         source_name,
         default_selector,
         resolved,
+        None,
         None,
     )
 }
@@ -1838,7 +1845,76 @@ pub fn compile_component_source_with_map_selector_resolved_and_registry(
         default_selector,
         resolved,
         selector_registry,
+        None,
     )
+}
+
+/// Like [`compile_component_source_with_map_selector_resolved_and_registry`] but ALSO supplying the file's
+/// LIBRARY scope ([`LibraryScope`], read by [`crate::library_scope::library_scope_for_source`] from the
+/// linked npm packages the file imports from).
+///
+/// With a library scope, a standalone component's `imports:` resolve through the published metadata: a
+/// directive is listed when its selector matches the template, a pipe when the template uses its name, and an
+/// NgModule contributes every directive and pipe it exports (TREATY-ISSUES T3/T9). `library == None` is
+/// byte-identical to the registry-only entry.
+pub fn compile_component_source_with_host_scope(
+    ts_source: &str,
+    file_name: &str,
+    source_name: &str,
+    default_selector: Option<&str>,
+    resolved: Option<&ResolvedContentMap>,
+    selector_registry: Option<&SelectorRegistry>,
+    library: Option<&LibraryScope>,
+) -> CompiledComponentWithMap {
+    compile_component_source_full(
+        ts_source,
+        file_name,
+        source_name,
+        default_selector,
+        resolved,
+        selector_registry,
+        library,
+    )
+}
+
+/// The external resources one `@Component` declares, as the author wrote them (relative to the source
+/// file): its `templateUrl`, and its stylesheets (`styleUrls`, or the singular `styleUrl` when that is the
+/// form used, as ngtsc reads them). A host reads these files and supplies the contents through
+/// [`ResolvedContentMap`]. TREATY-ISSUES T1.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalResources {
+    /// The class the `@Component` decorates.
+    pub class_name: String,
+    /// The `templateUrl` value, when the component declares one.
+    pub template_url: Option<String>,
+    /// The `styleUrls` entries (or the one `styleUrl`), in declaration order.
+    pub style_urls: Vec<String>,
+}
+
+/// The external `templateUrl` / `styleUrls` / `styleUrl` of every decorated `@Component` in `source`.
+/// Components with neither are omitted.
+pub fn external_resources(source: &str) -> Vec<ExternalResources> {
+    ParsingBackend::default().parse_module(source, SourceKind::TypeScriptModule, |module| {
+        module
+            .summary()
+            .classes
+            .iter()
+            .filter_map(|class| {
+                let class_name = class.name.clone()?;
+                let dec = class.decorators.iter().find(|d| d.name == "Component")?;
+                let obj = dec.object.as_ref()?;
+                let template_url = find_prop(obj, "templateUrl").and_then(string_value);
+                let style_urls = match find_prop(obj, "styleUrls") {
+                    Some(expr) => string_array_value(expr).unwrap_or_default(),
+                    None => find_prop(obj, "styleUrl").and_then(string_value).into_iter().collect(),
+                };
+                if template_url.is_none() && style_urls.is_empty() {
+                    return None;
+                }
+                Some(ExternalResources { class_name, template_url, style_urls })
+            })
+            .collect()
+    })
 }
 
 /// The shared body of the map-emitting source compile entries: parse, thread the
@@ -1851,6 +1927,7 @@ fn compile_component_source_full(
     default_selector: Option<&str>,
     resolved: Option<&ResolvedContentMap>,
     selector_registry: Option<&SelectorRegistry>,
+    library: Option<&LibraryScope>,
 ) -> CompiledComponentWithMap {
     let backend = ParsingBackend::default();
     backend.parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
@@ -1881,6 +1958,7 @@ fn compile_component_source_full(
             selector_registry,
             false,
             ClassShape::Assignments,
+            library,
         );
         CompiledComponentWithMap {
             code: compiled.code,
@@ -2197,6 +2275,7 @@ fn assemble_module(
     mut class_emits: std::collections::HashMap<usize, (ClassEmit, u32, u32)>,
     emit_partial_component: bool,
     class_shape: ClassShape,
+    extra_imports: &[ExtraImport],
 ) -> String {
     // Map a top-level statement start offset → the decorated class declared there (its `stmt_span`),
     // so the assembler can recover the class for member-decorator stripping + partial metadata.
@@ -2223,6 +2302,24 @@ fn assemble_module(
     let mut out = String::new();
     let mut cursor: usize = 0;
     let i0_line = "import * as i0 from \"@angular/core\";\n";
+    // Library imports the NgModule expansions need (TREATY-ISSUES T3/T9): `import { X as local } from '…'`.
+    // They are unused unless a component's `dependencies` names them, and the type-strip pass drops an unused
+    // import, so emitting the file's set is safe.
+    let extra_import_text: String = extra_imports
+        .iter()
+        .map(|x| {
+            if x.imported == x.local {
+                format!("import {{ {} }} from {};\n", x.local, json_string(&x.specifier))
+            } else {
+                format!(
+                    "import {{ {} as {} }} from {};\n",
+                    x.imported,
+                    x.local,
+                    json_string(&x.specifier)
+                )
+            }
+        })
+        .collect();
 
     for stmt in &summary.top_level {
         let span = top_stmt_span(stmt);
@@ -2352,6 +2449,7 @@ fn assemble_module(
                 out.push('\n');
             }
             out.push_str(i0_line);
+            out.push_str(&extra_import_text);
         }
     }
 
@@ -2362,13 +2460,19 @@ fn assemble_module(
 
     // No imports at all: the i0 line was never injected above — prepend it.
     if import_insert_at == 0 {
-        let mut prefixed = String::with_capacity(i0_line.len() + out.len());
+        let mut prefixed = String::with_capacity(i0_line.len() + extra_import_text.len() + out.len());
         prefixed.push_str(i0_line);
+        prefixed.push_str(&extra_import_text);
         prefixed.push_str(&out);
         out = prefixed;
     }
 
     out
+}
+
+/// A JavaScript double-quoted string literal for `s` (backslash and quote escaped).
+fn json_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Whether a top-level statement's source text is an `import` DECLARATION (`import …`, incl.
@@ -2449,6 +2553,7 @@ fn compile_program_with_source(
     selector_registry: Option<&SelectorRegistry>,
     emit_partial_component: bool,
     class_shape: ClassShape,
+    library: Option<&LibraryScope>,
 ) -> CompiledComponent {
     // Same-file constants in decorator metadata are folded first (see `const_fold`), so every reader below
     // sees the literal the author's identifier stands for.
@@ -2565,6 +2670,7 @@ fn compile_program_with_source(
             emit_partial_component,
             &ng,
             &source_file,
+            library,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2621,7 +2727,8 @@ fn compile_program_with_source(
         None
     };
 
-    let code = assemble_module(source, summary, emits, emit_partial_component, class_shape);
+    let extra_imports: &[ExtraImport] = library.map(|l| l.extra_imports.as_slice()).unwrap_or(&[]);
+    let code = assemble_module(source, summary, emits, emit_partial_component, class_shape, extra_imports);
 
     if let Some((ctx, map_out)) = map {
         if let Some((def_expr, member)) = single_def {
@@ -2682,6 +2789,48 @@ fn collect_sibling_directives(decorated: &[TopStmt]) -> Vec<crate::binder::Selec
         }
     }
     out
+}
+
+/// Fold a component's LIBRARY scope into its CSS-selector candidates, and return its library pipes.
+///
+/// A directive or component entry with a selector becomes a candidate named by its LOCAL identifier, so
+/// the binder's selector matcher lists it in `dependencies` when the template uses it. A sibling-declared
+/// class of the same name is authoritative and is not replaced. Pipe entries become `(pipe name, local)` in
+/// scope order (Angular lists pipes in the order the scope brings them in). The component itself is never
+/// its own dependency.
+fn merge_library_directives(
+    candidates: &mut Vec<crate::binder::SelectorDirective>,
+    entries: &[ScopeEntry],
+    own_class: &str,
+) -> Vec<(String, String)> {
+    let mut pipes: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        match entry.entity.kind {
+            LibraryKind::Directive | LibraryKind::Component => {
+                let Some(selector) = entry.entity.selector.as_deref() else { continue };
+                if selector.trim().is_empty() || entry.local == own_class {
+                    continue;
+                }
+                if candidates.iter().any(|c| c.name == entry.local) {
+                    continue;
+                }
+                candidates.push(crate::binder::SelectorDirective::new(
+                    entry.local.clone(),
+                    selector,
+                    entry.entity.kind == LibraryKind::Component,
+                ));
+            }
+            LibraryKind::Pipe => {
+                if let Some(pipe_name) = entry.entity.pipe_name.as_deref() {
+                    if !pipes.iter().any(|(_, local)| local == &entry.local) {
+                        pipes.push((pipe_name.to_string(), entry.local.clone()));
+                    }
+                }
+            }
+            LibraryKind::NgModule => {}
+        }
+    }
+    pipes
 }
 
 /// Fold the cross-module [`SelectorRegistry`] (`{ importName -> selector }`) into the per-file
@@ -2778,6 +2927,7 @@ impl DecoratorCompiler for ComponentCompiler {
             ctx.modernize,
             ctx.class_decl_positions,
             ctx.emit_partial_component,
+            ctx.library,
         )
     }
 }
@@ -2806,6 +2956,7 @@ impl DecoratorCompiler for DirectiveCompiler {
             ctx.modernize,
             ctx.class_decl_positions,
             ctx.emit_partial_component,
+            ctx.library,
         )
     }
 }
@@ -3152,6 +3303,7 @@ fn compile_decorated_class(
     emit_partial_component: bool,
     ng: &NgFacts,
     source_file: &std::rc::Rc<treaty_ivy_core::parse_util::ParseSourceFile>,
+    library: Option<&LibraryScope>,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.name {
         // The neutral `ClassWithDecorators::name_span` is the class NAME identifier's byte span — the
@@ -3189,6 +3341,7 @@ fn compile_decorated_class(
         jit_mode,
         module_with_providers,
         emit_partial_component,
+        library,
     };
 
     // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
@@ -3233,6 +3386,10 @@ fn compile_decorated_class(
                                 modernize,
                                 class_decl_positions,
                                 emit_partial_component,
+                                &library
+                                    .map(|scope| scope.entries_for(&component_import_names(meta.object)))
+                                    .unwrap_or_default(),
+                                &library.map(|l| l.resolved_bindings.clone()).unwrap_or_default(),
                             );
                         }
                         Err(reason) => facts_emit::record_fallback(&format!("facts: {reason}")),
@@ -3578,11 +3735,19 @@ fn compile_component_or_directive(
     modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
     emit_partial_component: bool,
+    library: Option<&LibraryScope>,
 ) -> Result<ClassEmit, String> {
     // The host-resolved external content for THIS class (keyed by class name), if the caller wired
     // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
     let resolved = resolved_content.and_then(|m| m.get(&class_name));
     let extract = treaty_directive_extract(class, kind, obj, resolved, default_selector, modernize)?;
+    // The LIBRARY scope of THIS class: the entries its own `imports:` array brings in (not the whole file's
+    // imports), in `imports` order. Empty when the host supplied no library scope.
+    let library_entries: Vec<ScopeEntry> = match library {
+        Some(scope) => scope.entries_for(&component_import_names(obj)),
+        None => Vec::new(),
+    };
+    let library_bound: Vec<String> = library.map(|l| l.resolved_bindings.clone()).unwrap_or_default();
     directive_emit(
         extract,
         class,
@@ -3595,7 +3760,37 @@ fn compile_component_or_directive(
         modernize,
         class_decl_positions,
         emit_partial_component,
+        &library_entries,
+        &library_bound,
     )
+}
+
+/// The names a component's `imports:` array refers to, in source order: a bare identifier, the target of a
+/// `forwardRef(() => X)`, and the elements of nested arrays. A namespace member (`ns.X`) and any other
+/// expression are not names this compiler can resolve, so they are skipped.
+fn component_import_names(obj: Option<&ObjLit>) -> Vec<String> {
+    fn collect(expr: &NExpr, out: &mut Vec<String>) {
+        match expr {
+            NExpr::Parenthesized(inner) => collect(inner, out),
+            NExpr::Array(elements) => {
+                for element in elements {
+                    if let crate::parse::NArrayElement::Expr(inner) = element {
+                        collect(inner, out);
+                    }
+                }
+            }
+            other => {
+                if let Some((name, _)) = directive_name_maybe_forward(other) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(expr) = obj.and_then(|o| find_prop(o, "imports")) {
+        collect(expr, &mut out);
+    }
+    out
 }
 
 /// The shared emit tail of a `@Component` / `@Directive`: builds the base directive metadata from an
@@ -3613,7 +3808,16 @@ fn directive_emit(
     modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
     emit_partial_component: bool,
+    library_entries: &[ScopeEntry],
+    library_bound: &[String],
 ) -> Result<ClassEmit, String> {
+    // Names the library scope resolved are matched by their real selector only (see
+    // `resolve_template_dependencies_scoped`); every other candidate keeps the attribute-name convention.
+    let attribute_fold_names: Vec<String> = auto_import_candidates
+        .iter()
+        .filter(|name| !library_bound.contains(name))
+        .cloned()
+        .collect();
     let DirectiveExtract {
         selector,
         template_html,
@@ -3672,11 +3876,15 @@ fn directive_emit(
             // CSS-selector directive candidates for THIS component: every sibling directive/
             // component (excluding self) that carries a selector. Fed to the binder's real
             // CssSelector matcher in `compile_component_meta` to populate `dependencies`.
-            let selector_candidates: Vec<crate::binder::SelectorDirective> = sibling_directives
+            let mut selector_candidates: Vec<crate::binder::SelectorDirective> = sibling_directives
                 .iter()
                 .filter(|d| d.name != class_name)
                 .cloned()
                 .collect();
+            // LIBRARY candidates (TREATY-ISSUES T3/T9): the directives and components this component's
+            // `imports:` bring in from linked packages, matched by the same CSS-selector matcher. Pipes are
+            // resolved by name below (`library_pipes`).
+            let library_pipes = merge_library_directives(&mut selector_candidates, library_entries, &class_name);
             let factory = class_factory_from_deps(&class_name, ctor_deps.clone(), FactoryTarget::Component);
             // PARTIAL mode: emit `ɵɵngDeclareComponent` from the metadata + the ORIGINAL template
             // string (no instruction lowering / decompilation). The DI-family `ɵfac` is still emitted
@@ -3698,6 +3906,7 @@ fn directive_emit(
                     view_providers,
                     preserve_whitespaces,
                     factory,
+                    &attribute_fold_names,
                 );
             }
             // `own_position` detects a dependency class declared LATER in the file (see
@@ -3719,6 +3928,8 @@ fn directive_emit(
                 own_position,
                 modernize,
                 class_decl_positions,
+                library_pipes,
+                &attribute_fold_names,
             )
         }
         // R4: @Directive — drive the existing `compile_directive_from_metadata` emitter (no
@@ -4132,6 +4343,8 @@ fn compile_component_meta(
     own_position: u32,
     modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
+    library_pipes: Vec<(String, String)>,
+    attribute_fold_names: &[String],
 ) -> Result<ClassEmit, String> {
     let class_name = base.name.clone();
     let mut errors: Vec<String> = Vec::new();
@@ -4169,7 +4382,7 @@ fn compile_component_meta(
     let candidates: Vec<String> = imported_names.to_vec();
     let selectorless_nodes = crate::compile::parse_template_selectorless(template_html);
     let mut declarations =
-        crate::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+        crate::compile::resolve_template_dependencies_scoped(&candidates, attribute_fold_names, &selectorless_nodes);
 
     // CROSS-CLASS CSS-SELECTOR MATCHING: feed every sibling-declared/imported directive selector
     // into the binder's real CssSelector matcher over the SAME bound template the component emits.
@@ -4307,6 +4520,7 @@ fn compile_component_meta(
         // (`Percent01Pipe` for `value | percent01`) is listed in `dependencies` — without this the
         // pipe was dropped and Ivy's `ɵɵpipe` threw `undefined.onDestroy` at render time.
         imported_directive_names: imported_names.to_vec(),
+        library_pipes,
     };
 
     let mut template_builder = RealTemplateBuilder;
@@ -4361,6 +4575,7 @@ fn compile_component_meta_partial(
     view_providers: Option<Expr>,
     preserve_whitespaces: Option<bool>,
     factory: R3FactoryMetadata,
+    attribute_fold_names: &[String],
 ) -> Result<ClassEmit, String> {
     use crate::partial_component_emit::{
         emit_ng_declare_component, PartialComponentInputs, PartialDependency,
@@ -4388,7 +4603,7 @@ fn compile_component_meta_partial(
     //    a pipe name in the template.
     let candidates: Vec<String> = imported_names.to_vec();
     let selectorless_nodes = crate::compile::parse_template_selectorless(template_html);
-    let resolved = crate::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+    let resolved = crate::compile::resolve_template_dependencies_scoped(&candidates, attribute_fold_names, &selectorless_nodes);
 
     // Build the partial `dependencies` entries, attaching each matched directive/component's CSS
     // selector from the candidate set (when known). The `kind` of a resolved dependency is recovered
@@ -4483,7 +4698,7 @@ AuthService.\u{0275}fac = function AuthService_Factory(__ngFactoryType__) {
 	/* @ts-ignore */
 	return new (__ngFactoryType__ || AuthService)(i0.\u{0275}\u{0275}inject(HttpClient), i0.\u{0275}\u{0275}inject(Config, 8));
 };
-AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
+AuthService.\u{0275}prov = /*@__PURE__*/ i0.\u{0275}\u{0275}defineInjectable({
 	token: AuthService,
 	factory: AuthService.\u{0275}fac,
 	providedIn: \"root\"
@@ -4633,7 +4848,7 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         let flat = normalize_ws(&out.code);
         assert!(flat.contains("export class C { x = 1; static \u{0275}fac = function C_Factory(__ngFactoryType__)"), "static ɵfac in body; got: {flat}");
-        assert!(flat.contains("static \u{0275}cmp = i0.\u{0275}\u{0275}defineComponent({"), "static ɵcmp in body; got: {flat}");
+        assert!(flat.contains("static \u{0275}cmp = /*@__PURE__*/ i0.\u{0275}\u{0275}defineComponent({"), "static ɵcmp in body; got: {flat}");
         assert!(!flat.contains("C.\u{0275}cmp ="), "no assignment shape in this mode; got: {flat}");
         // The default shape is unchanged for the same source.
         assert!(compile_component_source(src).code.contains("C.\u{0275}cmp ="));
@@ -4647,7 +4862,7 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
         let out = compile_static_members(src);
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         let flat = normalize_ws(&out.code);
-        assert!(flat.contains("static \u{0275}mod = i0.\u{0275}\u{0275}defineNgModule({ type: M })"), "static ɵmod; got: {flat}");
+        assert!(flat.contains("static \u{0275}mod = /*@__PURE__*/ i0.\u{0275}\u{0275}defineNgModule({ type: M })"), "static ɵmod; got: {flat}");
         assert!(flat.contains("static \u{0275}inj = "), "static ɵinj; got: {flat}");
         assert!(!flat.contains("M.\u{0275}inj ="), "no assignment-shape ɵinj; got: {flat}");
         let class_close = flat.find("static \u{0275}inj = ").unwrap();
@@ -6223,7 +6438,7 @@ export class AppRoot {}
         assert!(code.contains("type: AppRoot"), "def missing type ref; got: {code}");
         // The assignment wraps the def block: `AppRoot.ɵcmp = i0.ɵɵdefineComponent({`.
         assert!(
-            flat(code).contains(&format!("AppRoot.{}=i0.{}({{", "\u{0275}cmp", ZWS)),
+            flat(code).contains(&format!("AppRoot.{}=/*@__PURE__*/i0.{}({{", "\u{0275}cmp", ZWS)),
             "ɵcmp assignment does not wrap the def block; got: {code}"
         );
         // (6) the emitted module is syntactically valid TS (it parses with zero errors) — the bug it

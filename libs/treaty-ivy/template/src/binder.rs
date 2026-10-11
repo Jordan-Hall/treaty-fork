@@ -37,7 +37,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::expression::ast::{AstNode, AstVisitor, ExprKind};
+use crate::directive_matching::CssSelector;
+use crate::expression::ast::{AstNode, AstVisitor, BindingType, ExprKind};
 use crate::template::r3_ast::{
     self as t, BoundAttribute, BoundEvent, Component, Content, DeferredBlock, DeferredBlockError,
     DeferredBlockLoading, DeferredBlockPlaceholder, Directive, Element, ForLoopBlock,
@@ -328,75 +329,29 @@ pub enum DirectiveMatcher {
     Selectorless(SelectorlessMatcher<DirectiveMeta>),
 }
 
-/// Reduced `SelectorMatcher`. Each registered selector string is decomposed into one or more
-/// comma-separated *groups*. Each group carries an optional element name, required attribute names,
-/// required class names, and `:not(...)` negation groups. A node matches the selector when ANY
-/// positive group matches (element agrees or is unconstrained AND every required attribute/class is
-/// present) and NO `:not` group matches.
-///
-/// NOTE: still a *reduced* engine — it matches on attribute NAMES only (ignoring attribute values),
-/// which is exactly what `directive_matching` needs for the name-based bindings the source
-/// front-end models — but it now honours comma groups, CSS class selectors (`.cls`), and `:not`.
-#[derive(Default)]
-pub struct SelectorMatcher {
-    entries: Vec<(Vec<ParsedSelector>, Vec<DirectiveMeta>)>,
-}
-
-/// A parsed reduced selector group: `element.class[attr1][attr2]...:not(...)`.
-struct ParsedSelector {
-    element: Option<String>,
-    attributes: Vec<String>,
-    classes: Vec<String>,
-    /// `:not(...)` negative groups; the node matches only if NONE of these match.
-    not: Vec<ParsedSelector>,
-}
-
-impl ParsedSelector {
-    /// Whether this single group (ignoring `:not`) matches the node's reduced CSS selector.
-    fn group_matches(&self, css: &CssSelector) -> bool {
-        let element_ok = match &self.element {
-            None => true,
-            Some(name) => css.element.as_deref() == Some(name.as_str()),
-        };
-        if !element_ok {
-            return false;
-        }
-        if !self
-            .attributes
-            .iter()
-            .all(|a| css.attributes.iter().any(|x| x == a))
-        {
-            return false;
-        }
-        self.classes
-            .iter()
-            .all(|c| css.classes.iter().any(|x| x == c))
-    }
-
-    /// Full match including `:not(...)` negation.
-    fn matches(&self, css: &CssSelector) -> bool {
-        self.group_matches(css) && !self.not.iter().any(|n| n.group_matches(css))
-    }
-}
+/// Selector matching for the binder: Angular's `SelectorMatcher` (see [`crate::directive_matching`]) over
+/// the directive metadata the binder reports. A registered selector string is parsed as Angular's
+/// `CssSelector.parse` does (comma groups, attribute values, `:not`).
+pub type SelectorMatcher = crate::directive_matching::SelectorMatcher<DirectiveMeta>;
 
 impl SelectorMatcher {
-    pub fn new() -> Self {
-        SelectorMatcher::default()
-    }
-
-    /// `addSelectables(CssSelector.parse(selector), payloads)`. The selector string may carry
-    /// comma-separated groups; the node matches if ANY group matches.
-    pub fn add_selectables(&mut self, selector: &str, payloads: Vec<DirectiveMeta>) {
-        self.entries.push((parse_selector_list(selector), payloads));
-    }
-
-    /// `match(cssSelector, cb)` — collect every payload whose selector matches the node.
-    fn match_node(&self, css: &CssSelector, out: &mut Vec<DirectiveMeta>) {
-        for (groups, payloads) in &self.entries {
-            if groups.iter().any(|g| g.matches(css)) {
-                out.extend(payloads.iter().cloned());
-            }
+    /// `addSelectables(CssSelector.parse(selector), payloads)`: each payload is registered under every
+    /// comma group of `selector`. A selector that does not parse matches nothing (Angular reports it as an
+    /// error at compile time; the binder keeps going so one bad selector cannot hide the rest).
+    pub fn add_selector(&mut self, selector: &str, payloads: Vec<DirectiveMeta>) {
+        let Ok(groups) = CssSelector::parse(selector) else {
+            return;
+        };
+        for payload in payloads {
+            self.add_selectables(&groups, payload);
         }
+    }
+
+    /// Collect the payload of every registered selector that the node's selector matches.
+    fn match_node(&self, css: &CssSelector, out: &mut Vec<DirectiveMeta>) {
+        let mut hits = Vec::new();
+        self.match_selector(css, &mut hits);
+        out.extend(hits.into_iter().map(|(_, meta)| meta.clone()));
     }
 }
 
@@ -431,210 +386,47 @@ impl<T: Clone> Default for SelectorlessMatcher<T> {
     }
 }
 
-/// Reduced `CssSelector` extracted from a node (element name + attribute names + class names). See
-/// `createCssSelectorFromNode` in `util.ts`.
-struct CssSelector {
-    element: Option<String>,
-    attributes: Vec<String>,
-    classes: Vec<String>,
-}
-
-/// Split a selector string on top-level `,` (commas inside `:not(...)` are not split) and parse
-/// each comma group. Mirrors `CssSelector.parse`, which returns one selector per comma group.
-fn parse_selector_list(selector: &str) -> Vec<ParsedSelector> {
-    let mut groups = Vec::new();
-    let mut depth = 0usize;
-    let mut current = String::new();
-    for c in selector.chars() {
-        match c {
-            '(' => {
-                depth += 1;
-                current.push(c);
-            }
-            ')' => {
-                depth = depth.saturating_sub(1);
-                current.push(c);
-            }
-            ',' if depth == 0 => {
-                if !current.trim().is_empty() {
-                    groups.push(parse_selector(&current));
-                }
-                current.clear();
-            }
-            _ => current.push(c),
-        }
-    }
-    if !current.trim().is_empty() {
-        groups.push(parse_selector(&current));
-    }
-    if groups.is_empty() {
-        groups.push(parse_selector(""));
-    }
-    groups
-}
-
-/// Parse a reduced single selector group: `element.class[a][b]:not(...)` / `[a]` / `element`.
-fn parse_selector(selector: &str) -> ParsedSelector {
-    let mut element: Option<String> = None;
-    let mut attributes = Vec::new();
-    let mut classes = Vec::new();
-    let mut not = Vec::new();
-    let mut chars = selector.chars().peekable();
-    let mut current = String::new();
-    while let Some(&c) = chars.peek() {
-        match c {
-            '[' => {
-                chars.next();
-                let mut attr = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d == ']' {
-                        chars.next();
-                        break;
-                    }
-                    // Stop at '=' to drop any attribute value (reduced engine ignores values).
-                    if d == '=' {
-                        // consume up to ']'
-                        while let Some(&e) = chars.peek() {
-                            if e == ']' {
-                                chars.next();
-                                break;
-                            }
-                            chars.next();
-                        }
-                        break;
-                    }
-                    attr.push(d);
-                    chars.next();
-                }
-                if !attr.is_empty() {
-                    attributes.push(attr);
-                }
-            }
-            '.' => {
-                chars.next();
-                let mut cls = String::new();
-                while let Some(&d) = chars.peek() {
-                    if matches!(d, '.' | '[' | ':' | ' ') {
-                        break;
-                    }
-                    cls.push(d);
-                    chars.next();
-                }
-                if !cls.is_empty() {
-                    classes.push(cls);
-                }
-            }
-            ':' => {
-                // `:not(<inner>)` — capture the inner selector and parse it as a negation group.
-                chars.next();
-                let mut name = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d == '(' {
-                        break;
-                    }
-                    name.push(d);
-                    chars.next();
-                }
-                if chars.peek() == Some(&'(') {
-                    chars.next();
-                    let mut inner = String::new();
-                    let mut depth = 1usize;
-                    while let Some(&d) = chars.peek() {
-                        match d {
-                            '(' => depth += 1,
-                            ')' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    chars.next();
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        inner.push(d);
-                        chars.next();
-                    }
-                    if name == "not" {
-                        not.extend(parse_selector_list(&inner));
-                    }
-                }
-            }
-            _ => {
-                current.push(c);
-                chars.next();
-            }
-        }
-    }
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        element = Some(trimmed.to_string());
-    }
-    ParsedSelector {
-        element,
-        attributes,
-        classes,
-        not,
-    }
-}
-
-/// `createCssSelectorFromNode(node)` — build the reduced selector for an element or template.
-/// The element name for a `Template` is `"ng-template"`. Attribute names are gathered from text
-/// attributes, bound-attribute (input) names, output names, and (for templates) template-attr
-/// names — matching what the real `util.ts` feeds the matcher (names only, in our reduced engine).
-/// Static `class="..."` values additionally contribute individual class names.
+/// The node-side CSS selector of an element (Angular's `createCssSelectorFromNode`).
 fn css_selector_from_element(el: &Element) -> CssSelector {
-    let mut attributes = Vec::new();
-    let mut classes = Vec::new();
-    for a in &el.attributes {
-        attributes.push(a.name.clone());
-        if a.name == "class" {
-            classes.extend(split_class_value(&a.value));
-        }
-    }
-    for i in &el.inputs {
-        attributes.push(i.name.clone());
-    }
-    for o in &el.outputs {
-        attributes.push(o.name.clone());
-    }
-    CssSelector {
-        element: Some(el.name.clone()),
-        attributes,
-        classes,
-    }
+    let attributes: Vec<(String, String)> =
+        el.attributes.iter().map(|a| (a.name.clone(), a.value.clone())).collect();
+    let bound: Vec<String> = el
+        .inputs
+        .iter()
+        .filter(|i| matches!(i.kind, BindingType::Property | BindingType::TwoWay))
+        .map(|i| i.name.clone())
+        .collect();
+    let outputs: Vec<String> = el.outputs.iter().map(|o| o.name.clone()).collect();
+    crate::directive_matching::css_selector_from_node(Some(&el.name), &attributes, &bound, &outputs)
 }
 
+/// The node-side CSS selector of a structural template (Angular's `createCssSelectorFromNode` for a
+/// `Template`: `ng-template`, with the template's own attributes).
 fn css_selector_from_template(tpl: &Template) -> CssSelector {
-    let mut attributes = Vec::new();
-    let mut classes = Vec::new();
-    for a in &tpl.attributes {
-        attributes.push(a.name.clone());
-        if a.name == "class" {
-            classes.extend(split_class_value(&a.value));
-        }
-    }
-    for i in &tpl.inputs {
-        attributes.push(i.name.clone());
-    }
-    for o in &tpl.outputs {
-        attributes.push(o.name.clone());
-    }
-    for ta in &tpl.template_attrs {
-        match ta {
-            TemplateAttr::Bound(b) => attributes.push(b.name.clone()),
-            TemplateAttr::Text(tx) => attributes.push(tx.name.clone()),
-        }
-    }
-    CssSelector {
-        element: tpl.tag_name.clone(),
-        attributes,
-        classes,
-    }
-}
-
-/// Split a static `class="a b c"` attribute value into individual class tokens.
-fn split_class_value(value: &str) -> Vec<String> {
-    value.split_whitespace().map(|s| s.to_string()).collect()
+    let attributes: Vec<(String, String)> =
+        tpl.attributes.iter().map(|a| (a.name.clone(), a.value.clone())).collect();
+    let bound: Vec<String> = tpl
+        .inputs
+        .iter()
+        .filter(|i| matches!(i.kind, BindingType::Property | BindingType::TwoWay))
+        .map(|i| i.name.clone())
+        .collect();
+    let outputs: Vec<String> = tpl.outputs.iter().map(|o| o.name.clone()).collect();
+    let template_attrs: Vec<String> = tpl
+        .template_attrs
+        .iter()
+        .map(|ta| match ta {
+            TemplateAttr::Bound(b) => b.name.clone(),
+            TemplateAttr::Text(tx) => tx.name.clone(),
+        })
+        .collect();
+    crate::directive_matching::css_selector_from_template(
+        tpl.tag_name.as_deref(),
+        &attributes,
+        &bound,
+        &outputs,
+        &template_attrs,
+    )
 }
 
 // ===========================================================================
@@ -2397,7 +2189,7 @@ pub fn resolve_selector_dependencies(
             continue;
         }
         let meta = DirectiveMeta::new(c.name.clone(), Some(selector.to_string()), c.is_component);
-        matcher.add_selectables(selector, vec![meta]);
+        matcher.add_selector(selector, vec![meta]);
         any = true;
     }
     if !any {
@@ -2538,7 +2330,7 @@ mod tests {
 
         let mut sm = SelectorMatcher::new();
         let cmp_meta = DirectiveMeta::new("MyCmp", Some("my-cmp".to_string()), true);
-        sm.add_selectables("my-cmp", vec![cmp_meta.clone()]);
+        sm.add_selector("my-cmp", vec![cmp_meta.clone()]);
         let binder = R3TargetBinder::new(Some(DirectiveMatcher::Selector(sm)));
 
         let bound = binder.bind(Target {
@@ -2692,7 +2484,7 @@ mod tests {
         let mut sm = SelectorMatcher::new();
         let mut meta = DirectiveMeta::new("MyCmp", Some("my-cmp".to_string()), true);
         meta.inputs = ClassPropertyMapping::from_pairs([("foo", "foo")]);
-        sm.add_selectables("my-cmp", vec![meta]);
+        sm.add_selector("my-cmp", vec![meta]);
         let binder = R3TargetBinder::new(Some(DirectiveMatcher::Selector(sm)));
         let bound = binder.bind(Target {
             template: Some(&nodes),

@@ -137,6 +137,10 @@ pub mod source_compile;
 /// declaration object instead of a decorator. Depends on `core`, `template`, and `decorators`.
 pub mod linker;
 
+/// The library scope of a source file: the directives, components, pipes and NgModules its imports bring
+/// in from linked npm packages, read from their published partial declarations.
+pub mod library_scope;
+
 pub use linker::link_partial;
 
 /// The Angular **partial-declaration emitter** — the INVERSE of [`linker`]: rewrite an AOT

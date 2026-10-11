@@ -19,6 +19,8 @@ path = "src/main.rs"
 [dependencies]
 treaty_ivy = { path = "../../libs/treaty-ivy/facade" }
 rust_authoring = { path = "../../libs/authoring/rust" }
+# Component stylesheet resolution + SCSS/Sass preprocessing (the same resolver ng-packagr's step uses).
+treaty_packagr = { path = "../../libs/packagr" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

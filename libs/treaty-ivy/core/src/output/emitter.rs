@@ -67,7 +67,7 @@ use oxc_span::{SourceType, SPAN};
 
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
-use crate::output::comments::{comment_lines, expr_comment_text, expr_has_identifier_head};
+use crate::output::comments::{comment_lines, expr_comment_text, expr_has_identifier_head, head_has_pure_comment};
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
 use crate::output::emit_options::current_emit_options;
 use crate::output::emit_options::{with_emit_options, EmitOptions};
@@ -773,17 +773,26 @@ impl<'a> Lowerer<'a> {
                 callee,
                 args,
                 optional,
+                pure,
                 ..
             } => {
                 let callee_expr = self.lower_expr(callee);
                 let arguments = self.lower_args(args);
-                self.ast.expression_call(
+                let mut call = self.ast.expression_call(
                     SPAN,
                     callee_expr,
                     oxc_ast::NONE,
                     arguments,
                     *optional,
-                )
+                );
+                // A pure call is marked `/*@__PURE__*/` right before its callee, as ngtsc does for definitions. A
+                // call whose source already carries the annotation (a re-emitted partial) keeps just that one.
+                let already_marked = head_has_pure_comment(expr);
+                if *pure && !already_marked {
+                    let marker = self.register_comment(vec!["/*@__PURE__*/".to_string()]);
+                    prefix_head_identifier(self, &mut call, &format!("__treaty_lc{marker}__"));
+                }
+                call
             }
 
             ExprKind::New { class_expr, args } => {
@@ -2726,5 +2735,18 @@ mod leading_comment_tests {
             o::leading_comment("two\nthree", false, true),
         ];
         assert_eq!(emit_statements(&[stmt]), "/* one */\n// two\n// three\na;\n");
+    }
+
+    #[test]
+    fn pure_invocations_are_marked_before_their_callee() {
+        let pure = o::variable("ɵɵdefineComponent", None).call_fn(vec![], true);
+        let plain = o::variable("ɵɵsetComponentScope", None).call_fn(vec![], false);
+        let stmts = vec![
+            o::Stmt::bare(StmtKind::Expression(pure)),
+            o::Stmt::bare(StmtKind::Expression(plain)),
+        ];
+        let out = emit_statements(&stmts);
+        assert!(out.contains("/*@__PURE__*/ ɵɵdefineComponent()"), "got: {out}");
+        assert!(!out.contains("/*@__PURE__*/ ɵɵsetComponentScope"), "got: {out}");
     }
 }

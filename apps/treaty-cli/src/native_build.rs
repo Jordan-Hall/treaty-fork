@@ -25,9 +25,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crate::bundle::{bundle, BundleModule, OutputFormat};
+use crate::host_scope::{host_for_file, FileHost, FsModuleLoader};
 use crate::resolve::{is_under_node_modules, ModuleResolver};
 use crate::selectors::{self, ProjectSelectors};
-use crate::transform::{lower_with_registry, rewrite_imports};
+use crate::transform::{lower_with_host_scope, rewrite_imports};
+use treaty_ivy::library_scope::LibraryIndex;
+use treaty_ivy::source_compile::HostScope;
 
 /// The result of a native build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +51,12 @@ pub struct NativeBuildOptions {
     pub entry: PathBuf,
     /// Output directory.
     pub out_dir: PathBuf,
+    /// The emitted shape: one module file per graph module (the default), or ONE bundle file (TREATY-ISSUES T4).
+    pub format: OutputFormat,
 }
+
+/// The file a single-file bundle is written to, under the output directory.
+pub const BUNDLE_FILE: &str = "bundle.js";
 
 /// A processed graph module: its emitted code and the imports to rewrite.
 struct GraphModule {
@@ -61,6 +70,9 @@ struct GraphModule {
     /// can re-lower it with the project's cross-module selector registry. `None` for published /
     /// pass-through modules (which carry no `@Component` template to resolve).
     raw_source: Option<String>,
+    /// The host-resolved inputs of an authoring module: its library scope (what its imports bring from linked
+    /// packages) and the contents of its external `templateUrl` / stylesheets. Empty for other modules.
+    host: FileHost,
 }
 
 /// A stable, filesystem-safe output file name for an absolute module path.
@@ -107,6 +119,9 @@ fn build_graph(
     // job — the compiler never reads another file; it consumes the per-file `{ importName -> selector }`
     // registry we derive from this scan in the second pass below.
     let mut project_selectors: ProjectSelectors = ProjectSelectors::new();
+    // One library index and one loader per build: every published package is read and parsed once.
+    let library_index = LibraryIndex::new();
+    let loader = FsModuleLoader::new();
 
     while let Some(abs) = queue.pop_front() {
         if graph.contains_key(&abs) {
@@ -129,8 +144,22 @@ fn build_graph(
         } else {
             None
         };
+        let host = if is_authoring(&abs) {
+            host_for_file(&source, &abs, &library_index, &loader)
+                .map_err(|e| format!("{}: {e}", abs.display()))?
+        } else {
+            FileHost::default()
+        };
         let code = if is_authoring(&abs) {
-            let lowered = lower_with_registry(&source, &abs.to_string_lossy(), None);
+            let lowered = lower_with_host_scope(
+                &source,
+                &abs.to_string_lossy(),
+                HostScope {
+                    selectors: None,
+                    resolved: Some(&host.resolved),
+                    library: Some(&host.library),
+                },
+            );
             if !lowered.errors.is_empty() {
                 return Err(format!(
                     "{}: {}",
@@ -183,7 +212,7 @@ fn build_graph(
 
         graph.insert(
             abs.clone(),
-            GraphModule { abs, code, edges, raw_source },
+            GraphModule { abs, code, edges, raw_source, host },
         );
     }
 
@@ -206,8 +235,15 @@ fn build_graph(
             let Some(registry) = selectors::registry_for_source(raw, &project_selectors) else {
                 continue;
             };
-            let lowered =
-                lower_with_registry(raw, &module.abs.to_string_lossy(), Some(&registry));
+            let lowered = lower_with_host_scope(
+                raw,
+                &module.abs.to_string_lossy(),
+                HostScope {
+                    selectors: Some(&registry),
+                    resolved: Some(&module.host.resolved),
+                    library: Some(&module.host.library),
+                },
+            );
             if lowered.errors.is_empty() && !lowered.code.is_empty() {
                 module.code = lowered.code;
                 // Recompute edges from the re-lowered code so a re-introduced import rewrites to its
@@ -258,7 +294,14 @@ fn count_ngdeclare_calls(code: &str) -> usize {
         while j < bytes.len() && (bytes[j] as char).is_whitespace() {
             j += 1;
         }
-        if j < bytes.len() && bytes[j] == b'(' {
+        // A DEFINITION is not a call: `@angular/core`'s own runtime declares
+        // `function ɵɵngDeclareComponent(decl) {` (TREATY-ISSUES T2). Those are preceded by the
+        // `function` keyword, so they are skipped even though they are followed by `(`.
+        let before = code[..start].trim_end();
+        let preceded_by_function = before.strip_suffix("function").is_some_and(|rest| {
+            !rest.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        });
+        if j < bytes.len() && bytes[j] == b'(' && !preceded_by_function {
             count += 1;
         }
         from = i.max(start + needle.len());
@@ -325,6 +368,10 @@ pub fn build(opts: &NativeBuildOptions) -> Result<NativeBuildOutput, String> {
 
     let graph = build_graph(&resolver, &entry)?;
 
+    if opts.format != OutputFormat::Modules {
+        return build_bundle(opts, &graph, &entry);
+    }
+
     let modules_dir = opts.out_dir.join("_treaty");
     std::fs::create_dir_all(&modules_dir).map_err(|e| format!("mkdir dist: {e}"))?;
 
@@ -386,13 +433,81 @@ pub fn build(opts: &NativeBuildOptions) -> Result<NativeBuildOutput, String> {
     Ok(NativeBuildOutput { written: all, notes })
 }
 
+/// Write the single-file bundle of the graph (TREATY-ISSUES T4): `bundle.js` in the output directory, and an
+/// `index.html` that loads it. Every graph module is hoisted into one scope by [`crate::bundle::bundle`].
+fn build_bundle(
+    opts: &NativeBuildOptions,
+    graph: &BTreeMap<PathBuf, GraphModule>,
+    entry: &Path,
+) -> Result<NativeBuildOutput, String> {
+    let indices: BTreeMap<&PathBuf, usize> = graph.keys().enumerate().map(|(i, p)| (p, i)).collect();
+    let mut modules: Vec<BundleModule> = Vec::with_capacity(graph.len());
+    for module in graph.values() {
+        let edges = module
+            .edges
+            .iter()
+            .filter_map(|(spec, dep)| indices.get(dep).map(|&i| (spec.clone(), i)))
+            .collect();
+        modules.push(BundleModule {
+            label: module.abs.display().to_string(),
+            code: module.code.clone(),
+            edges,
+        });
+    }
+    let entry_index = *indices
+        .get(&entry.to_path_buf())
+        .ok_or_else(|| "entry was not in the build graph".to_string())?;
+    let code = bundle(&modules, entry_index, opts.format)?.code;
+
+    std::fs::create_dir_all(&opts.out_dir).map_err(|e| format!("mkdir dist: {e}"))?;
+    let bundle_path = opts.out_dir.join(BUNDLE_FILE);
+    std::fs::write(&bundle_path, &code).map_err(|e| format!("write bundle: {e}"))?;
+    let (index_script_type, index_html) = match opts.format {
+        OutputFormat::Script => (None, render_index_for_bundle(&opts.root, BUNDLE_FILE, false)),
+        _ => (Some("module"), render_index_for_bundle(&opts.root, BUNDLE_FILE, true)),
+    };
+    let _ = index_script_type;
+    let index_path = opts.out_dir.join("index.html");
+    std::fs::write(&index_path, index_html).map_err(|e| format!("write index.html: {e}"))?;
+
+    let residual_partials = count_ngdeclare_calls(&code);
+    let imports_compiler = imports_angular_compiler(&code);
+    let notes = vec![
+        format!(
+            "native bundle: {} module(s) in one {} file ({} bytes)",
+            graph.len(),
+            opts.format.as_str(),
+            code.len()
+        ),
+        format!(
+            "AOT health: residualNgDeclare={residual_partials} importsCompiler={imports_compiler} (both 0/false = no JIT needed)"
+        ),
+        "minification is not part of the native bundle (use --bundler rolldown for a minified build)".to_string(),
+    ];
+    Ok(NativeBuildOutput {
+        written: vec![index_path, bundle_path],
+        notes,
+    })
+}
+
+/// The bundle's `index.html`: the app's shell with the bundle loaded by a classic script (`module == false`)
+/// or an ES module script.
+fn render_index_for_bundle(root: &Path, file: &str, module: bool) -> String {
+    let kind = if module { " type=\"module\"" } else { "" };
+    render_index_with(root, &format!("./{file}"), kind)
+}
+
 /// Render the dist `index.html`: reuse the app's own shell when present (so the
 /// `<app-root>` / `<base href>` match), pointing its module script at the entry.
 fn render_index(root: &Path, entry_rel: &str) -> String {
+    render_index_with(root, entry_rel, " type=\"module\"")
+}
+
+fn render_index_with(root: &Path, src: &str, kind: &str) -> String {
     let raw = std::fs::read_to_string(root.join("index.html")).unwrap_or_else(|_| {
         "<!doctype html><html><head><base href=\"/\"></head><body><app-root></app-root></body></html>".to_string()
     });
-    let script = format!("\n<script type=\"module\" src=\"{entry_rel}\"></script>\n");
+    let script = format!("\n<script{kind} src=\"{src}\"></script>\n");
     if let Some(idx) = raw.rfind("</body>") {
         let mut out = String::with_capacity(raw.len() + script.len());
         out.push_str(&raw[..idx]);
@@ -419,6 +534,24 @@ mod tests {
         assert!(a.starts_with("app-"));
     }
 
+    /// The AOT-health counter counts unlinked partial CALLS only. The definitions in `@angular/core`'s
+    /// runtime (`function ɵɵngDeclareComponent(decl) {`) and bare names (exports, references) are not
+    /// calls (TREATY-ISSUES T2).
+    #[test]
+    fn ngdeclare_counter_counts_calls_not_definitions() {
+        let runtime = "function \u{0275}\u{0275}ngDeclareComponent(decl) {\n  return decl;\n}\n\
+                       export { \u{0275}\u{0275}ngDeclareComponent, \u{0275}\u{0275}ngDeclareDirective };\n\
+                       const x = \u{0275}\u{0275}ngDeclareDirective;\n";
+        assert_eq!(count_ngdeclare_calls(runtime), 0, "definitions and names are not calls");
+
+        let unlinked = "X.\u{0275}cmp = i0.\u{0275}\u{0275}ngDeclareComponent({ type: X });\n\
+                        Y.\u{0275}pipe = i0.\u{0275}\u{0275}ngDeclarePipe ({ name: 'p' });\n";
+        assert_eq!(count_ngdeclare_calls(unlinked), 2, "two unlinked calls must count");
+
+        let myfunction = "myfunction \u{0275}\u{0275}ngDeclarePipe(x)";
+        assert_eq!(count_ngdeclare_calls(myfunction), 1, "an identifier ending in `function` is not the keyword");
+    }
+
     #[test]
     fn builds_a_two_module_graph_to_bootable_esm() {
         let dir = std::env::temp_dir().join(format!("treaty-nb-{}", std::process::id()));
@@ -441,6 +574,7 @@ mod tests {
             root: dir.clone(),
             entry: dir.join("main.ts"),
             out_dir: dir.join("dist"),
+            format: crate::bundle::OutputFormat::Modules,
         })
         .expect("build ok");
 
@@ -501,6 +635,7 @@ mod tests {
             root: dir.clone(),
             entry: dir.join("main.ts"),
             out_dir: dir.join("dist"),
+            format: crate::bundle::OutputFormat::Modules,
         })
         .expect("build ok");
         assert!(!out.written.is_empty());

@@ -65,6 +65,18 @@ pub fn expr_has_identifier_head(expr: &o::Expr) -> bool {
     }
 }
 
+/// Whether a leading `@__PURE__` annotation already prints before this call's head identifier (a re-emitted
+/// partial carries the annotation as a comment on that identifier or on the callee chain), so the emitter
+/// must not add a second one.
+pub fn head_has_pure_comment(expr: &o::Expr) -> bool {
+    let own = expr_comment_text(&expr.meta.leading_comments).contains("@__PURE__");
+    own || match &expr.kind {
+        ExprKind::Invoke { callee, .. } => head_has_pure_comment(callee),
+        ExprKind::ReadProp { receiver, .. } | ExprKind::ReadKey { receiver, .. } => head_has_pure_comment(receiver),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

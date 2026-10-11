@@ -141,6 +141,10 @@ enum Command {
         /// Actually invoke the external bundler (default: emit config only).
         #[arg(long)]
         run: bool,
+        /// Output shape of the native build: `modules` (one ES module per graph module, the default), `script`
+        /// (ONE classic script, an IIFE that adds no globals) or `esm` (ONE ES module).
+        #[arg(long, default_value = "modules")]
+        format: String,
         /// Entry source files to compile (the no-`angular.json` form). When an
         /// `angular.json` resolves the target, these are ignored.
         entries: Vec<PathBuf>,
@@ -306,6 +310,7 @@ fn main() -> ExitCode {
             target,
             no_federation,
             run,
+            format,
             entries,
         } => run_build(
             project,
@@ -316,6 +321,7 @@ fn main() -> ExitCode {
             target.into(),
             no_federation,
             run,
+            format,
             entries,
         ),
         Command::Dev { root, bundler, host, port, no_federation, run, entries } => {
@@ -617,8 +623,13 @@ fn run_build(
     target: Target,
     no_federation: bool,
     run: bool,
+    format: String,
     entries: Vec<PathBuf>,
 ) -> ExitCode {
+    let Some(format) = treaty_cli::bundle::OutputFormat::parse(&format) else {
+        eprintln!("treaty: unknown --format '{format}' (use modules, script or esm)");
+        return ExitCode::FAILURE;
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let resolve_at = match &root {
         Some(r) if r.is_absolute() => r.clone(),
@@ -653,7 +664,7 @@ fn run_build(
         // run it through Treaty's native module-graph build, honoring
         // outputPath/browser/index/styles/assets.
         ProjectConfig::Angular(ang) => {
-            run_angular_build(&ang, out_dir)
+            run_angular_build(&ang, out_dir, format)
         }
         // CONVENTION PATH: the documented `<entries>` form over the configured
         // bundler (native module-graph build, or the external bundler config).
@@ -705,7 +716,11 @@ fn run_build(
 /// module-graph build (a bootable, JIT-free ESM dist). The architect target
 /// supplies the entry (`browser`/`main`) and the output dir (`outputPath`); a
 /// `--out-dir` override still wins.
-fn run_angular_build(ang: &AngularResolvedConfig, out_dir_override: Option<PathBuf>) -> ExitCode {
+fn run_angular_build(
+    ang: &AngularResolvedConfig,
+    out_dir_override: Option<PathBuf>,
+    format: treaty_cli::bundle::OutputFormat,
+) -> ExitCode {
     eprintln!(
         "treaty: building project {:?} target build{} via {} (native Rust module-graph)",
         ang.target.project,
@@ -725,6 +740,7 @@ fn run_angular_build(ang: &AngularResolvedConfig, out_dir_override: Option<PathB
         root: ang.project_root.clone(),
         entry: ang.entry.clone(),
         out_dir,
+        format,
     };
     match native_build::build(&opts) {
         Ok(out) => {
@@ -770,6 +786,7 @@ fn run_native_build(root: &Path, entries: &[PathBuf], out_dir: &Path) -> ExitCod
         root: root.to_path_buf(),
         entry: entry_abs,
         out_dir: out_dir.to_path_buf(),
+        format: treaty_cli::bundle::OutputFormat::Modules,
     };
     eprintln!("treaty: building with native (Rust module-graph bundler)");
     match native_build::build(&opts) {

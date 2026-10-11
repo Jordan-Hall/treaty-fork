@@ -46,7 +46,7 @@
 
 use std::cell::RefCell;
 
-use crate::output::comments::{comment_lines as comment_lines_for, expr_comment_text, expr_has_identifier_head};
+use crate::output::comments::{comment_lines as comment_lines_for, expr_comment_text, expr_has_identifier_head, head_has_pure_comment};
 use crate::output::emit_options::{current_emit_options, EmitOptions};
 use crate::output::source_map::{utf16_columns, utf16_offset_to_line_col, SourceMapBuilder};
 use crate::output_ast::{
@@ -641,8 +641,18 @@ impl Printer {
                 callee,
                 args,
                 optional,
+                pure,
                 ..
             } => {
+                let already_marked = head_has_pure_comment(expr);
+                if *pure && !already_marked {
+                    // `/*@__PURE__*/` goes directly before the callee's leading identifier, after any comment the
+                    // enclosing expression already queued for that identifier.
+                    self.pending_head = Some(match self.pending_head.take() {
+                        Some(text) => format!("{text} /*@__PURE__*/"),
+                        None => "/*@__PURE__*/".to_string(),
+                    });
+                }
                 // A function / arrow callee must be parenthesized — `function(){}()` would parse as a
                 // function DECLARATION followed by `()`, so the IIFE form is `(function(){})()`.
                 // `oxc_codegen` wraps the callee (not the whole call), which also means the enclosing

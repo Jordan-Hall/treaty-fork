@@ -21,7 +21,7 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | Skipped (un-runnable) | 471 |
 | **Pass-rate (of runnable subset)** | **100.0%** (189/189) |
 | Pass-rate (of full corpus) | 28.6% (189/660) |
-| **Partial-golden bucket** (separate; no full golden) | **57.1%** PASS (238/417 runnable, 448 candidates, 179 DIFF, 31 skipped) |
+| **Partial-golden bucket** (separate; no full golden) | **58.3%** PASS (243/417 runnable, 448 candidates, 174 DIFF, 31 skipped) |
 
 ### How a case is run and matched
 
@@ -273,21 +273,20 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
 | --- | --- |
 | Candidates (no full golden) | 448 |
 | Runnable | 417 |
-| PASS | 238 |
-| DIFF | 179 |
+| PASS | 243 |
+| DIFF | 174 |
 | Skipped | 31 |
 
 ### Partial DIFF categories
 
 | Count | Category (token at which the golden stops matching) |
 | --- | --- |
-| 121 | `token-outside-instruction` |
-| 9 | `placeholder-binding` |
+| 115 | `token-outside-instruction` |
+| 10 | `placeholder-binding` |
 | 4 | `missing-instruction:ɵɵdomProperty` |
 | 4 | `args-of:ɵɵelement` |
 | 3 | `args-of:ɵɵtextInterpolate1` |
 | 3 | `args-of:ɵɵelementStart` |
-| 3 | `missing-instruction:ɵɵelementStart` |
 | 2 | `args-of:ɵɵtextInterpolate` |
 | 2 | `args-of:ɵɵrestoreView` |
 | 2 | `args-of:ɵɵdomProperty` |
@@ -295,6 +294,7 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
 | 2 | `args-of:ɵɵstyleProp` |
 | 2 | `missing-instruction:ɵɵi18n` |
 | 2 | `args-of:ɵɵnextContext` |
+| 2 | `args-of:ɵɵdefineInjector` |
 | 1 | `missing-instruction:ɵɵExternalStylesFeature` |
 | 1 | `args-of:ɵɵdomElement` |
 | 1 | `missing-instruction:ɵɵadvance` |
@@ -302,6 +302,7 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
 | 1 | `args-of:ɵɵi18nStart` |
 | 1 | `missing-instruction:ɵɵelement` |
 | 1 | `args-of:ɵɵinjectAttribute` |
+| 1 | `missing-instruction:ɵɵelementStart` |
 | 1 | `args-of:ɵɵdeferOnInteraction` |
 | 1 | `args-of:ɵɵpipe` |
 | 1 | `missing-instruction:ɵɵtextInterpolate1` |
@@ -334,6 +335,10 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
   - missing "," after "...ɵɵconditionalCreate(0, MyApp_Case_0_Template, 1, 1"
 - `args-of:ɵɵdeferOnInteraction` — r3_view_compiler_deferred/should generate a deferred block with an interaction trigger in a parent view
   - missing "1" after "\t\ti0.ɵɵdeferOnInteraction("
+- `args-of:ɵɵdefineInjector` — r3_compiler_compliance/components_and_directives/standalone/should optimize injector imports
+  - missing "}" after "... static ɵinj = /*@__PURE__*/ i0.ɵɵdefineInjector({"
+- `args-of:ɵɵdefineInjector` — r3_compiler_compliance/ng_modules/should not pass along empty array fields to the declaration
+  - missing "}" after "... static ɵinj = /*@__PURE__*/ i0.ɵɵdefineInjector({"
 - `args-of:ɵɵdomElement` — r3_view_compiler_i18n/should support i18n nodes with ICUs inside
   - missing "(" after "\t\ti0.ɵɵdomElement"
 - `args-of:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should chain multiple host property bindings in the presence of other bindings
@@ -402,10 +407,6 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
   - missing "ɵdomProperty" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵelement` — r3_view_compiler_i18n/nested_nodes/should handle i18n attributes in nested templates
   - missing "ɵelement" after "\t\ti0.ɵ"
-- `missing-instruction:ɵɵelementStart` — r3_view_compiler_deferred/should generate a deferred block with an interaction trigger inside the placeholder
-  - missing "ɵelementStart" after "\t\ti0.ɵ"
-- `missing-instruction:ɵɵelementStart` — r3_view_compiler_deferred/should generate a deferred block with implicit trigger references
-  - missing "ɵelementStart" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵelementStart` — r3_view_compiler_deferred/should generate a deferred block with no dependencies followed by one that has dependencies
   - missing "ɵelementStart" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵExternalStylesFeature` — r3_view_compiler_styling/component_styles/should emit external runtime styles component feature for file-based styles when 'externalRuntimeStyles' option is enabled
@@ -444,6 +445,8 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
   - missing "$r3$" after "\n"
 - `placeholder-binding` — r3_view_compiler_deferred/should generate a deferred block with prefetch triggers
   - missing "$r3$" after "\n"
+- `placeholder-binding` — r3_view_compiler_di/di/should support forward refs in a providedIn clause
+  - missing "$i0$" after "\tprovidedIn:"
 - `token-outside-instruction` — r3_compiler_compliance/class_metadata/should capture Angular property decorators
   - missing "__decorate" after "\n"
 - `token-outside-instruction` — r3_compiler_compliance/class_metadata/should capture constructor parameters
@@ -460,8 +463,6 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
   - missing "(" after "\tdependencies:"
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/standalone/should generate dependencies array from imports
   - missing "SomeModule" after "\n"
-- `token-outside-instruction` — r3_compiler_compliance/components_and_directives/standalone/should optimize injector imports
-  - missing "/*" after "  static ɵinj ="
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/standalone/should support recursivity in templates
   - missing "dependencies" after ""
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/value_composition/should optimize regular expressions without flags
@@ -474,10 +475,6 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
   - missing "0" after "\n"
 - `token-outside-instruction` — r3_compiler_compliance/elements/should support namespaces on attributes
   - missing "0" after "\n"
-- `token-outside-instruction` — r3_compiler_compliance/ng_modules/should handle providers passed in as a variable
-  - missing "/*" after "  static ɵinj ="
-- `token-outside-instruction` — r3_compiler_compliance/ng_modules/should not pass along empty array fields to the declaration
-  - missing "/*" after "  static ɵinj ="
 - `token-outside-instruction` — r3_compiler_compliance/ng_modules/should not process NgModules that are marked `jit`
   - missing "let" after ""
 - `token-outside-instruction` — r3_view_compiler_bindings/attribute_bindings/should handle duplicate bindings
@@ -530,22 +527,16 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
   - missing "_forTrack0" after "function"
 - `token-outside-instruction` — r3_view_compiler_deferred/should generate a lazy deferred block with empty and placeholder
   - missing "function" after "\n"
-- `token-outside-instruction` — r3_view_compiler_di/di/should create a factory definition for an injectable
-  - missing "/*" after "  static ɵprov ="
-- `token-outside-instruction` — r3_view_compiler_di/di/should create a factory definition for an injectable with an overloaded constructor
-  - missing "/*" after "  static ɵprov ="
 - `token-outside-instruction` — r3_view_compiler_di/di/should delegate directly to the alternate class factory when setting `useClass` without `deps`
-  - missing "/*" after "  static ɵprov ="
+  - missing "'root'" after "\tprovidedIn:"
 - `token-outside-instruction` — r3_view_compiler_di/di/should delegate directly to the alternate factory when setting `useFactory` without `deps`
-  - missing "/*" after "  static ɵprov ="
+  - missing "'root'" after "\tprovidedIn:"
 - `token-outside-instruction` — r3_view_compiler_di/di/should not delegate directly to the alternate class when setting `useClass` with `deps`
-  - missing "/*" after "  static ɵprov ="
+  - missing "'root'" after "\tprovidedIn:"
 - `token-outside-instruction` — r3_view_compiler_di/di/should not delegate directly to the alternate factory when setting `useFactory` with `deps`
-  - missing "/*" after "  static ɵprov ="
-- `token-outside-instruction` — r3_view_compiler_di/di/should support forward refs in a providedIn clause
-  - missing "/*" after "  static ɵprov ="
+  - missing "'root'" after "\tprovidedIn:"
 - `token-outside-instruction` — r3_view_compiler_di/di/should unwrap forward refs when delegating to a different class
-  - missing "/*" after "  static ɵprov ="
+  - missing "SomeProviderImpl" after "\tfactory: __ngFactoryType__ =>"
 - `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support complex expressions in interpolation
   - missing "2" after "\tdecls:"
 - `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support complex expressions in interpolation with legacyOptionalChaining
@@ -709,6 +700,7 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
 - r3_compiler_compliance/elements/should support <ng-container>
 - r3_compiler_compliance/elements/should translate DOM structure
 - r3_compiler_compliance/elements/should validate iframe attributes
+- r3_compiler_compliance/ng_modules/should handle providers passed in as a variable
 - r3_view_compiler/any/should preserve $any if it is accessed through `this`
 - r3_view_compiler/any/should strip out $any wrappers
 - r3_view_compiler/legacy_animations/should dedup multiple [@event] listeners
@@ -800,8 +792,12 @@ source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
 - r3_view_compiler_deferred/should generate a defer block with an `on idle` trigger that has a timeout
 - r3_view_compiler_deferred/should generate a deferred block with a `when` trigger that has a pipe
 - r3_view_compiler_deferred/should generate a deferred block with an interaction trigger in the same view
+- r3_view_compiler_deferred/should generate a deferred block with an interaction trigger inside the placeholder
+- r3_view_compiler_deferred/should generate a deferred block with implicit trigger references
 - r3_view_compiler_deferred/should generate a deferred block with triggers
 - r3_view_compiler_deferred/should insert hydrate triggers before all other triggers
+- r3_view_compiler_di/di/should create a factory definition for an injectable
+- r3_view_compiler_di/di/should create a factory definition for an injectable with an overloaded constructor
 - r3_view_compiler_i18n/element_attributes/should add the meaning and description as JsDoc comments and metadata blocks
 - r3_view_compiler_i18n/element_attributes/should not create translations for empty attributes
 - r3_view_compiler_i18n/element_attributes/should sanitize ids and generate proper variable names

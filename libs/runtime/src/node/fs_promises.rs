@@ -664,6 +664,7 @@ mod tests {
             agent,
             realm,
             host_state,
+            ..
         } = rt;
         let host_state = host_state
             .as_deref()

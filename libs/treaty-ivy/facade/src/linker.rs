@@ -1658,6 +1658,7 @@ fn link_component(obj: Props) -> Result<LinkedDef, String> {
         // verbatim (carried into `declarations` above), so the linker never re-resolves pipes from
         // imports — leave the import-scope empty.
         imported_directive_names: Vec::new(),
+        library_pipes: Vec::new(),
     };
 
     let mut template_builder = RealTemplateBuilder;
@@ -1781,7 +1782,16 @@ fn link_partial_walk(code: &str, declares: &[crate::parse::NgDeclareCall]) -> Li
     replacements.sort_by(|a, b| b.start.cmp(&a.start));
     let mut out = code.to_string();
     for r in &replacements {
-        out.replace_range(r.start..r.end, &r.text);
+        // A definition's `/*@__PURE__*/` annotation sits just before its span and is re-emitted by the new text,
+        // so the replacement takes it over rather than doubling it.
+        let mut start = r.start;
+        if r.text.starts_with("/*@__PURE__*/") {
+            let before = out[..start].trim_end_matches([' ', '\t']);
+            if before.ends_with("/*@__PURE__*/") {
+                start = before.len() - "/*@__PURE__*/".len();
+            }
+        }
+        out.replace_range(start..r.end, &r.text);
     }
 
     // Append the module-scope scope side effects.

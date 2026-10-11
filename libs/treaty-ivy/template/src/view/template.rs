@@ -5861,13 +5861,16 @@ impl TemplateDefinitionBuilder {
         } else {
             output.name.clone()
         };
-        let handler_name = format!(
+        // Angular `naming.ts` sanitises the COMPOSED handler name (`op.handlerFnName =
+        // sanitizeIdentifier(op.handlerFnName)`), not just the event part. Without it a
+        // `window:resize` or `keydown.enter` event yields an invalid identifier (TREATY-ISSUES T7/T8).
+        let handler_name = sanitize_identifier(&format!(
             "{}_{}_{}_{}_listener",
             self.name,
             tag.replace('-', "_"),
             event_in_name,
             slot,
-        );
+        ));
         // Only add the `$event` parameter when the handler AST actually references `$event`.
         let params = if is_two_way || handler_references_dollar_event(&output.handler) {
             vec![FnParam::new(EVENT_NAME, None)]
@@ -7642,8 +7645,11 @@ impl TemplateDefinitionBuilder {
     ) -> (Expr, usize, usize) {
         // Carry BOTH the per-block lazy dependency set (463ad8a) and the i18n sub-template
         // continuation (21f8979).
+        // A deferred block's view belongs to the component's compilation mode, as Angular's single
+        // `TemplateCompilationMode` covers every view of the component: `Full` for a component with
+        // directive dependencies (`ɵɵelementStart`), `DomOnly` otherwise.
         let nested_input = TemplateCompilationInput::new(fn_name.clone(), children)
-            .with_dom_only(true)
+            .with_dom_only(self.dom_only)
             .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
         nested.foreign_components = self.foreign_components.clone();
@@ -10204,6 +10210,49 @@ mod tests {
         let consts = emit_expression(&builder.const_pool().to_const_array().unwrap());
         assert!(consts.contains("3"), "got: {consts}");
         assert!(consts.contains("\"click\""), "got: {consts}");
+    }
+
+    #[test]
+    fn target_and_key_event_listeners_get_sanitized_handler_names() {
+        // Angular `naming.ts` sanitises the composed listener name: `(window:resize)` and
+        // `(keydown.enter)` must not reach the identifier unchanged (TREATY-ISSUES T7/T8). The event
+        // name argument of `ɵɵlistener` stays the raw event.
+        for (event, expected_fn) in [
+            ("window:resize", "Test_Template_div_window_resize_0_listener"),
+            ("keydown.enter", "Test_Template_div_keydown_enter_0_listener"),
+        ] {
+            let nodes = vec![Node::Element(Element {
+                name: "div".to_string(),
+                attributes: vec![],
+                inputs: vec![],
+                outputs: vec![BoundEvent {
+                    name: event.to_string(),
+                    kind: ParsedEventType::Regular,
+                    handler: call_f(),
+                    target: None,
+                    phase: None,
+                    source_span: t_span(),
+                    handler_span: t_span(),
+                    key_span: t_span(),
+                }],
+                directives: vec![],
+                children: vec![],
+                references: vec![],
+                is_self_closing: false,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                is_void: false,
+                i18n: None,
+            })];
+            let input = TemplateCompilationInput::new("Test_Template", nodes);
+            let mut builder = TemplateDefinitionBuilder::new(&input);
+            let func = builder.build_template_function(&input);
+            let out = emit_expression(&func);
+            assert!(out.contains(expected_fn), "{event}: handler name not sanitized; got: {out}");
+            assert!(out.contains(&format!("\"{event}\"")), "{event}: event name changed; got: {out}");
+            assert!(!out.contains(&format!("{event}_0_listener")), "{event}: raw name leaked; got: {out}");
+        }
     }
 
     #[test]

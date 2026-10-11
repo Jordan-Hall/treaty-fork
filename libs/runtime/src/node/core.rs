@@ -82,7 +82,24 @@ pub(crate) struct HostState {
     builtin_cache: RefCell<HashMap<&'static str, Global<Object<'static>>>>,
     /// Lazy cache of loaded user modules, keyed by absolute resolved path.
     module_cache: RefCell<HashMap<PathBuf, Global<Object<'static>>>>,
+    /// Host functions an embedder registered by name (see `JsRuntime::register_host_function`). Each takes
+    /// the JSON-decoded arguments and returns a JSON value or an error message.
+    host_functions: HostFunctions,
 }
+
+/// The registry behind [`HostState::host_functions`]. A manual `Debug` keeps [`HostState`] debuggable without
+/// requiring the closures to be.
+#[derive(Default)]
+pub(crate) struct HostFunctions(RefCell<HashMap<String, HostFn>>);
+
+impl std::fmt::Debug for HostFunctions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostFunctions").field("count", &self.0.borrow().len()).finish()
+    }
+}
+
+/// A host function: JSON arguments in, a JSON result or an error message out.
+pub(crate) type HostFn = std::rc::Rc<dyn Fn(&[serde_json::Value]) -> Result<serde_json::Value, String>>;
 
 impl HostState {
     /// Build a fresh host state rooted at `cwd`, capturing the current process environment.
@@ -95,7 +112,18 @@ impl HostState {
             env,
             builtin_cache: RefCell::new(HashMap::new()),
             module_cache: RefCell::new(HashMap::new()),
+            host_functions: HostFunctions::default(),
         }
+    }
+
+    /// The host function registered under `name`, if any.
+    pub(crate) fn host_function(&self, name: &str) -> Option<HostFn> {
+        self.host_functions.0.borrow().get(name).cloned()
+    }
+
+    /// Register (or replace) the host function `name`.
+    pub(crate) fn set_host_function(&self, name: &str, function: HostFn) {
+        self.host_functions.0.borrow_mut().insert(name.to_string(), function);
     }
 
     /// Borrow the event loop (microtask + timer queues and the drain pump).

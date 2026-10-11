@@ -22,6 +22,8 @@
 //! arguments. Both reuse the same Nova engine and the same TS->JS step.
 
 use std::fmt;
+use std::rc::Rc;
+use std::time::Instant;
 
 mod node;
 mod transpile;
@@ -30,14 +32,19 @@ pub use transpile::{transpile_ts, TranspileError};
 
 use nova_vm::{
     ecmascript::{
-        Agent, AgentOptions, DefaultHostHooks, GcAgent, Object, String as JsString, parse_script,
-        script_evaluation,
+        Agent, AgentOptions, Behaviour, BuiltinFunctionArgs, DefaultHostHooks, ExceptionType,
+        GcAgent, InternalMethods, JsResult, Object, PropertyDescriptor, PropertyKey,
+        String as JsString, Value, create_builtin_function, parse_script, script_evaluation,
     },
     engine::{Bindable, GcScope},
 };
 use serde_json::Value as JsonValue;
 
 use crate::node::core::HostState;
+
+/// The internal native that carries a JavaScript call of a host function into Rust. Installed on the global
+/// object of runtimes made by [`JsRuntime::embedded`] only; it is not part of the JavaScript surface.
+const HOST_CALL_NATIVE: &str = "__treaty_host_call";
 
 /// An error raised while preparing or executing a script.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +90,9 @@ impl std::error::Error for RuntimeError {}
 pub struct JsRuntime {
     agent: GcAgent,
     realm: nova_vm::ecmascript::RealmRoot,
+    /// Whether `eval*` drains the event loop after the script (the Node-compat behaviour). An embedded runtime
+    /// does not: its host drives the loop explicitly with [`JsRuntime::pump`], so `eval` never blocks on a timer.
+    drains_on_eval: bool,
     // SAFETY: drop order. When the Node-compat layer is enabled, the agent below holds a
     // `&'static HostState` produced by `node::core::extend_lifetime` from this box. Rust drops
     // fields in declaration order, so `agent` (declared first) is destroyed before `host_state`
@@ -103,10 +113,172 @@ impl JsRuntime {
         Self {
             agent,
             realm,
+            drains_on_eval: false,
             host_state: None,
         }
     }
 
+    /// Construct an EMBEDDED runtime for a host that drives JavaScript from its own scheduler.
+    ///
+    /// It has the host-state event loop (promise jobs, generic jobs and timers, see [`JsRuntime::pump`]),
+    /// an injectable clock ([`JsRuntime::set_clock`]), and host functions ([`JsRuntime::register_host_function`]).
+    /// It has NO Node globals (`process`, `setTimeout`, `URL`, …) and `eval` does not block on the event loop.
+    /// A plain [`JsRuntime::new`] keeps the pure-engine behaviour, and [`JsRuntime::with_node_compat`] keeps
+    /// the Node surface; neither changes.
+    pub fn embedded() -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let env = std::env::vars().collect();
+        let host_state = Box::new(HostState::new(cwd, env));
+
+        // SAFETY: the same lifetime extension as `with_node_compat`: `host_state` is the last field of the
+        // returned struct, so it outlives `agent` (see the field-drop-order comment on `JsRuntime::host_state`).
+        let hooks: &'static HostState = unsafe { node::core::extend_lifetime(&*host_state) };
+        let mut agent = GcAgent::new(
+            AgentOptions {
+                disable_gc: false,
+                print_internals: false,
+                no_block: false,
+            },
+            hooks,
+        );
+        let realm = agent.create_default_realm();
+        let mut runtime = Self {
+            agent,
+            realm,
+            drains_on_eval: false,
+            host_state: Some(host_state),
+        };
+        runtime.install_host_bridge();
+        runtime
+    }
+
+    /// Install the internal native that dispatches host-function calls on the global object.
+    fn install_host_bridge(&mut self) {
+        let JsRuntime { agent, realm, .. } = self;
+        agent.run_in_realm(realm, |agent, gc| {
+            let function = create_builtin_function(
+                agent,
+                Behaviour::Regular(host_call),
+                BuiltinFunctionArgs::new(2, HOST_CALL_NATIVE),
+                gc.nogc(),
+            );
+            let global = agent.current_realm(gc.nogc()).global_object(agent);
+            let key = PropertyKey::from_static_str(agent, HOST_CALL_NATIVE, gc.nogc());
+            let defined = global.unbind().try_define_own_property(
+                agent,
+                key.unbind(),
+                PropertyDescriptor::new_data_descriptor(function),
+                None,
+                gc.nogc(),
+            );
+            assert!(defined.is_continue(), "defining the host bridge on the global object");
+        });
+    }
+
+    /// Register a host function under `name`: JavaScript can call `name(...)` and receive its result.
+    ///
+    /// The arguments are marshalled as JSON: the function receives them as a `&[serde_json::Value]` and returns
+    /// `Ok(value)`, which the caller receives as the JavaScript value of the same JSON shape. `Err(message)` is
+    /// thrown in JavaScript as an `Error` with that message, so a script can `try`/`catch` it, and an uncaught
+    /// one surfaces from `eval` as [`RuntimeError::Runtime`]. Registering a name again replaces the function.
+    /// Requires a runtime made by [`JsRuntime::embedded`].
+    pub fn register_host_function<F>(&mut self, name: &str, function: F) -> Result<(), RuntimeError>
+    where
+        F: Fn(&[JsonValue]) -> Result<JsonValue, String> + 'static,
+    {
+        let Some(host) = self.host_state.as_deref() else {
+            return Err(RuntimeError::Runtime(
+                "register_host_function needs a runtime made by JsRuntime::embedded()".to_owned(),
+            ));
+        };
+        host.set_host_function(name, Rc::new(function));
+        // The JavaScript wrapper: forwards its arguments as a JSON array and parses the JSON result.
+        let name_json = serde_json::to_string(name).expect("a string serializes to JSON");
+        let source = format!(
+            "globalThis[{name_json}] = function (...args) {{ return JSON.parse({HOST_CALL_NATIVE}({name_json}, JSON.stringify(args))); }};"
+        );
+        self.eval(&source).map(|_| ())
+    }
+
+    /// Call a JavaScript function with JSON arguments and return its result as JSON.
+    ///
+    /// `function` is a JavaScript expression that evaluates to the function, for example `"render"` or
+    /// `"globalThis.app.handle"`. It is evaluated with the same semantics as [`JsRuntime::eval`], so the
+    /// expression is trusted host input, not user input.
+    pub fn call(&mut self, function: &str, args: &[JsonValue]) -> Result<JsonValue, RuntimeError> {
+        let args_json = serde_json::to_string(args)
+            .map_err(|e| RuntimeError::Conversion(format!("arguments are not JSON: {e}")))?;
+        self.eval(&format!("({function}).apply(undefined, {args_json})"))
+    }
+
+    /// Replace the runtime's clock. Timers are scheduled against it and [`JsRuntime::pump`] tests them against
+    /// it, so an embedder can run timers on virtual time. The default is the monotonic clock.
+    /// Requires a runtime made by [`JsRuntime::embedded`].
+    pub fn set_clock<F>(&mut self, clock: F) -> Result<(), RuntimeError>
+    where
+        F: Fn() -> Instant + 'static,
+    {
+        let Some(host) = self.host_state.as_deref() else {
+            return Err(RuntimeError::Runtime(
+                "set_clock needs a runtime made by JsRuntime::embedded()".to_owned(),
+            ));
+        };
+        host.event_loop().set_clock(Rc::new(clock));
+        Ok(())
+    }
+
+    /// Run every job that is runnable now and return without waiting: promise jobs first, then generic jobs,
+    /// then the timers whose deadline the clock has reached. A timer that is not yet due stays scheduled and is
+    /// reported in [`PumpReport::next_timer`], so the host can sleep or schedule until then. A job that throws
+    /// stops the pump and its error is returned as [`RuntimeError::Runtime`].
+    ///
+    /// A plain runtime has no event loop, so `pump` reports nothing to do.
+    pub fn pump(&mut self) -> Result<PumpReport, RuntimeError> {
+        let JsRuntime {
+            agent,
+            realm,
+            host_state,
+            ..
+        } = self;
+        let Some(host) = host_state.as_deref() else {
+            return Ok(PumpReport::default());
+        };
+        let event_loop = host.event_loop();
+        let jobs_run = agent.run_in_realm(realm, |agent, mut gc| -> Result<usize, RuntimeError> {
+            let mut jobs_run = 0usize;
+            let outcome = node::event_loop::pump_ready(agent, event_loop, &mut jobs_run, gc.reborrow())
+                .unbind();
+            match outcome {
+                Ok(()) => Ok(jobs_run),
+                Err(error) => {
+                    let message = error
+                        .value()
+                        .unbind()
+                        .string_repr(agent, gc)
+                        .to_string_lossy(agent)
+                        .into_owned();
+                    Err(RuntimeError::Runtime(message))
+                }
+            }
+        })?;
+        Ok(PumpReport {
+            jobs_run,
+            next_timer: event_loop.next_timer_deadline(),
+            idle: event_loop.is_idle(),
+        })
+    }
+
+    /// The deadline of the nearest scheduled timer, if any (see [`JsRuntime::pump`]).
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        self.host_state.as_deref().and_then(|h| h.event_loop().next_timer_deadline())
+    }
+
+    /// Whether the event loop has nothing left to run: no promise job, no generic job and no timer.
+    pub fn is_idle(&self) -> bool {
+        self.host_state.as_deref().is_none_or(|h| h.event_loop().is_idle())
+    }
+
+    // SAFETY: drop order.
     /// Construct a runtime with the Treaty Node-compatibility layer installed.
     ///
     /// This wires a [`HostState`] (the microtask/timer event loop, the `oxc_resolver`-backed module
@@ -176,6 +348,7 @@ impl JsRuntime {
         Self {
             agent,
             realm,
+            drains_on_eval: true,
             host_state: Some(host_state),
         }
     }
@@ -207,11 +380,16 @@ impl JsRuntime {
         let JsRuntime {
             agent,
             realm,
+            drains_on_eval,
             host_state,
         } = self;
-        // Borrow the event loop out of the (optional) host state for the drain below. `None` for a
-        // plain `JsRuntime::new`, in which case no draining happens and behavior is unchanged.
-        let event_loop = host_state.as_deref().map(|s| s.event_loop());
+        // Borrow the event loop out of the (optional) host state for the drain below. `None` for a plain
+        // `JsRuntime::new` and for an embedded runtime (which the host pumps itself), so no draining happens.
+        let event_loop = if *drains_on_eval {
+            host_state.as_deref().map(|s| s.event_loop())
+        } else {
+            None
+        };
 
         let outcome = agent.run_in_realm(realm, |agent, mut gc| -> Result<String, RuntimeError> {
             // Build the source string on the Nova heap.
@@ -305,6 +483,56 @@ impl Default for JsRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What one [`JsRuntime::pump`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PumpReport {
+    /// Jobs that ran: promise jobs, generic jobs and due timers.
+    pub jobs_run: usize,
+    /// The deadline of the nearest timer still scheduled, if any.
+    pub next_timer: Option<Instant>,
+    /// Whether the loop has nothing left to run after this pump.
+    pub idle: bool,
+}
+
+/// The native behind `__treaty_host_call(name, json_args)`: dispatch to the host function `name` and return its
+/// JSON result as text. A missing function or a host error is thrown as a JavaScript `Error`.
+fn host_call<'gc>(
+    agent: &mut Agent,
+    _this: Value,
+    args: nova_vm::ecmascript::ArgumentsList,
+    mut gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let name = args
+        .get(0)
+        .unbind()
+        .string_repr(agent, gc.reborrow())
+        .to_string_lossy(agent)
+        .into_owned();
+    let payload = args
+        .get(1)
+        .unbind()
+        .string_repr(agent, gc.reborrow())
+        .to_string_lossy(agent)
+        .into_owned();
+    let gc = gc.into_nogc();
+    match dispatch_host_call(agent, &name, &payload) {
+        Ok(text) => Ok(JsString::from_string(agent, text, gc).into()),
+        Err(message) => Err(agent.throw_exception(ExceptionType::Error, message, gc)),
+    }
+}
+
+/// Run the host function `name` on the JSON `payload` (an array of arguments) and return its JSON result.
+fn dispatch_host_call(agent: &Agent, name: &str, payload: &str) -> Result<String, String> {
+    let host = node::core::host_state(agent).ok_or_else(|| "no host bridge installed".to_owned())?;
+    let function = host
+        .host_function(name)
+        .ok_or_else(|| format!("no host function named {name}"))?;
+    let args: Vec<JsonValue> =
+        serde_json::from_str(payload).map_err(|e| format!("host call arguments: {e}"))?;
+    let value = function(&args)?;
+    serde_json::to_string(&value).map_err(|e| format!("host function result: {e}"))
 }
 
 /// The value a macro produced for injection, captured as JSON.

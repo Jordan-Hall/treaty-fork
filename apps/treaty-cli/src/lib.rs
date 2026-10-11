@@ -19,12 +19,14 @@
 
 pub mod affected;
 pub mod angular;
+pub mod bundle;
 pub mod bundler;
 pub mod compile;
 pub mod config;
 pub mod core;
 pub mod deploy;
 pub mod generate;
+pub mod host_scope;
 pub mod native_build;
 pub mod node_cmd;
 pub mod plugin;

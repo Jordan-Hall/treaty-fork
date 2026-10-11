@@ -12,7 +12,7 @@ use oxc_span::SourceType;
 use treaty_ivy::source_compile::{
     compile_component_source_with_map_and_selector,
     compile_component_source_with_map_selector_and_resolved,
-    compile_component_source_with_map_selector_resolved_and_registry, ResolvedContentMap,
+    compile_component_source_with_map_selector_resolved_and_registry, HostScope, ResolvedContentMap,
     SelectorRegistry,
 };
 
@@ -373,6 +373,43 @@ pub fn compile_angular_source_with_registry(
         Some(&default_selector),
         None,
         Some(registry),
+    );
+    CompiledAuthoring {
+        code: compiled.code,
+        server_module: None,
+        errors: compiled.errors,
+        map: map_or_none(compiled.map),
+    }
+}
+
+/// The `.ts` entry for a file whose host-resolved scope (project selectors, external `templateUrl`/`styleUrls`
+/// content, and the library scope of its imports) is supplied as one [`HostScope`].
+///
+/// With nothing provided this routes identically to [`compile_angular_source`]. Otherwise the
+/// common no-`server {…}`-block `@Component`/`@Directive` path compiles with the whole scope, and any other
+/// shape falls back to the standard router, as [`compile_angular_source_with_registry`] does.
+pub fn compile_angular_source_with_host_scope(
+    source: &str,
+    file_name: &str,
+    host: HostScope<'_>,
+) -> CompiledAuthoring {
+    if !host.is_provided() {
+        return compile_angular_source(source, file_name);
+    }
+    let extraction = extract_server_block(source);
+    let kinds = detect_angular_decorators(&extraction.client_source);
+    if kinds.is_empty() || !extraction.server_fns.is_empty() {
+        return compile_angular_source(source, file_name);
+    }
+    let default_selector = to_multi_selector(file_name);
+    let compiled = treaty_ivy::source_compile::compile_component_source_with_host_scope(
+        source,
+        GENERATED_NAME,
+        SOURCE_NAME,
+        Some(&default_selector),
+        host.resolved,
+        host.selectors,
+        host.library,
     );
     CompiledAuthoring {
         code: compiled.code,
