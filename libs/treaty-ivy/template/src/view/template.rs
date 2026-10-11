@@ -1023,6 +1023,14 @@ struct I18nInterpolation {
     sub_template_index: Option<usize>,
     /// This interpolation's expression index WITHIN its view (the `n` of the `�n�`/`�n:sub�` value).
     expr_index_in_view: usize,
+    /// The ICU sub-message this expression is a `VAR_<type>` of (`None` for an ordinary
+    /// interpolation of the message). Such an expression is a postprocessing param of that ICU's own
+    /// message (`i18n_text_extraction.ts`: an expression inside an ICU resolves at postprocessing
+    /// time), while still emitting its `ɵɵi18nExp` in the enclosing i18n block.
+    icu: Option<String>,
+    /// The authored `{{ … }}` source of the interpolation (`Placeholder.sourceSpan`), when known; the
+    /// `original_code` of its placeholder.
+    original: Option<String>,
 }
 
 /// Faithful i18n message collector — the owned analogue of `i18n_parser.ts`'s `_I18nVisitor`.
@@ -1043,6 +1051,46 @@ struct I18nCollector {
     /// Per-view expression counter (keyed by sub-template index), so each interpolation gets its
     /// view-local `n` for the `�n�`/`�n:sub�` runtime value.
     expr_counts: std::collections::HashMap<Option<usize>, usize>,
+    /// The ICU sub-messages collected in this block, in source order (`placeholderToMessage`).
+    icus: Vec<IcuSub>,
+    /// The authored source of each tag placeholder (`placeholderToContent[name].text`), first seen
+    /// wins: the `original_code` of the placeholder in `goog.getMsg`'s options.
+    originals: std::collections::HashMap<String, String>,
+}
+
+/// The source text of an element's start and end tags, for a tag placeholder's `original_code`
+/// (`i18n_parser.ts` `_visitElementLike`: `startSourceSpan.toString()`, `endSourceSpan`).
+#[derive(Default)]
+struct TagSourceSpans {
+    start: String,
+    end: Option<String>,
+}
+
+impl TagSourceSpans {
+    fn of(
+        start: &crate::ml_parser::ParseSourceSpan,
+        end: Option<&crate::ml_parser::ParseSourceSpan>,
+    ) -> Self {
+        TagSourceSpans {
+            start: start.to_source_string(),
+            end: end.map(|e| e.to_source_string()),
+        }
+    }
+}
+
+/// An ICU nested in an i18n message: its placeholder name, its own `[Icu]` message and the source
+/// text of the expansion (the `original_code` of its placeholder).
+struct IcuSub {
+    /// The placeholder name (`ICU`, `ICU_1`, or the name a repeated expansion shares).
+    name: String,
+    /// The unique owner of this ICU's expressions (`I18nInterpolation::icu`): several ICUs can share
+    /// one placeholder name, so ownership is by position, not by name.
+    owner: String,
+    message: crate::i18n::Message,
+    source: String,
+    /// The non-variable placeholders of the ICU (`Icu.placeholders`): the tag/text content of its
+    /// cases, which Angular resolves at postprocessing time.
+    placeholders: Vec<(String, t::IcuPlaceholder)>,
 }
 
 impl I18nCollector {
@@ -1054,6 +1102,15 @@ impl I18nCollector {
             current_sub: None,
             next_sub: 1,
             expr_counts: std::collections::HashMap::new(),
+            icus: Vec::new(),
+            originals: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record the authored source of a tag placeholder the first time its name is seen.
+    fn note_original(&mut self, name: &str, text: String) {
+        if !text.is_empty() {
+            self.originals.entry(name.to_string()).or_insert(text);
         }
     }
 
@@ -1083,16 +1140,24 @@ impl I18nCollector {
             Node::BoundText(bt) => self.visit_bound_text(bt),
             Node::Element(el) => {
                 let attrs = static_attr_pairs(&el.attributes);
-                self.push_tag_placeholder(&el.name, &attrs, el.is_void, &el.children);
+                let spans = TagSourceSpans::of(&el.start_source_span, el.end_source_span.as_ref());
+                self.push_tag_placeholder(&el.name, &attrs, el.is_void, &el.children, spans);
             }
             Node::Component(c) => {
                 let attrs = static_attr_pairs(&c.attributes);
                 // A selectorless component uses its full tag name (`i18n_parser.ts` `node.fullName`).
-                self.push_tag_placeholder(&c.full_name, &attrs, false, &c.children);
+                let spans = TagSourceSpans::of(&c.start_source_span, c.end_source_span.as_ref());
+                self.push_tag_placeholder(&c.full_name, &attrs, false, &c.children, spans);
             }
             Node::Content(c) => {
                 // `<ng-content>` projects: its tag is `ng-content` (never void here).
-                self.push_tag_placeholder(Content::NAME, &[], false, &c.children);
+                self.push_tag_placeholder(
+                    Content::NAME,
+                    &[],
+                    false,
+                    &c.children,
+                    TagSourceSpans::default(),
+                );
             }
             Node::Template(t) => {
                 // `<ng-template>` inside i18n: a `START_TAG_NG_TEMPLATE`/`CLOSE_TAG_NG_TEMPLATE`
@@ -1104,7 +1169,22 @@ impl I18nCollector {
                     .clone()
                     .unwrap_or_else(|| "ng-template".to_string());
                 let attrs = static_attr_pairs(&t.attributes);
-                self.push_tag_placeholder_sub(&tag, &attrs, false, &t.children);
+                // A structural directive (`<span *ngIf>`) wraps the element itself: the html element
+                // is the one i18n sees (one placeholder, named after the element), and its content is
+                // the sub-template's content (`i18n_parser.ts` never sees the desugared template).
+                let desugared_element = match t.children.as_slice() {
+                    [Node::Element(el)] if tag != "ng-template" && el.name == tag => {
+                        Some((el.is_void, el.children.clone()))
+                    }
+                    _ => None,
+                };
+                let spans = TagSourceSpans::of(&t.start_source_span, t.end_source_span.as_ref());
+                match desugared_element {
+                    Some((is_void, children)) => {
+                        self.push_tag_placeholder_sub(&tag, &attrs, is_void, &children, spans)
+                    }
+                    None => self.push_tag_placeholder_sub(&tag, &attrs, false, &t.children, spans),
+                }
             }
             Node::IfBlock(b) => self.visit_if_block(b),
             Node::SwitchBlock(b) => self.visit_switch_block(b),
@@ -1148,13 +1228,15 @@ impl I18nCollector {
         use crate::i18n;
         match &bt.value.kind {
             AstExprKind::Interpolation { strings, expressions } => {
+                // Each placeholder's `original_code` is the authored `{{ … }}` (its source span).
+                let sources = interpolation_source_pieces(&bt.source_span.to_source_string());
                 for (i, expr) in expressions.iter().enumerate() {
                     if let Some(s) = strings.get(i) {
                         if !s.is_empty() {
                             self.nodes.push(i18n::Node::Text(i18n::Text { value: s.clone() }));
                         }
                     }
-                    self.push_interpolation(expr);
+                    self.push_interpolation_with_source(expr, sources.get(i).cloned());
                 }
                 if let Some(last) = strings.last() {
                     if !last.is_empty() {
@@ -1170,13 +1252,29 @@ impl I18nCollector {
     /// Register one interpolation: assign a placeholder name (base `INTERPOLATION`, de-duped on the
     /// reconstructed expression source), push the `Placeholder` node and record the expression.
     fn push_interpolation(&mut self, expr: &AstNode) {
+        self.push_interpolation_with_source(expr, None);
+    }
+
+    /// [`Self::push_interpolation`] with the authored `{{ … }}` of the expression, when known.
+    fn push_interpolation_with_source(&mut self, expr: &AstNode, source: Option<String>) {
         use crate::i18n;
         // `i18n_parser.ts`: the registry signature is keyed on the normalized expression text; the
         // `Placeholder.value` (used by the UID/digest serializer) is that same normalized source.
-        let normalized = ast_to_source(expr);
-        let name = self.registry.placeholder_name("INTERPOLATION", &normalized);
+        //
+        // With the authored `{{ … }}` known, the expression is its raw text (`preserveExpressionWhitespace`),
+        // and a `// i18n(ph="NAME")` comment in it names the placeholder (`extractPlaceholderName`).
+        let (value, base_name) = match source.as_deref().and_then(|src| {
+            src.strip_prefix("{{").and_then(|rest| rest.strip_suffix("}}"))
+        }) {
+            Some(inner) => (
+                inner.to_string(),
+                i18n::extract_placeholder_name(inner).unwrap_or_else(|| "INTERPOLATION".to_string()),
+            ),
+            None => (ast_to_source(expr), "INTERPOLATION".to_string()),
+        };
+        let name = self.registry.placeholder_name(&base_name, &value);
         self.nodes.push(i18n::Node::Placeholder(i18n::Placeholder {
-            value: normalized,
+            value,
             name: name.clone(),
         }));
         let idx = self.expr_counts.entry(self.current_sub).or_insert(0);
@@ -1187,6 +1285,8 @@ impl I18nCollector {
             placeholder_name: name,
             sub_template_index: self.current_sub,
             expr_index_in_view,
+            icu: None,
+            original: source,
         });
     }
 
@@ -1199,15 +1299,22 @@ impl I18nCollector {
         attrs: &[(String, String)],
         is_void: bool,
         children: &[Node],
+        spans: TagSourceSpans,
     ) {
         use crate::i18n;
         let start_name = self.registry.start_tag_placeholder_name(tag, attrs, is_void);
+        self.note_original(&start_name, spans.start.clone());
         let collected = self.collect_children(children);
         let close_name = if is_void {
             String::new()
         } else {
             self.registry.close_tag_placeholder_name(tag)
         };
+        if !is_void {
+            // `placeholderToContent[closePhName].text` (the end tag as authored; a namespaced
+            // `<xhtml:div>` keeps its prefix in the goldens).
+            self.note_original(&close_name, spans.end.unwrap_or_else(|| format!("</{tag}>")));
+        }
         self.nodes.push(i18n::Node::TagPlaceholder(i18n::TagPlaceholder {
             tag: tag.to_string(),
             start_name,
@@ -1226,9 +1333,11 @@ impl I18nCollector {
         attrs: &[(String, String)],
         is_void: bool,
         children: &[Node],
+        spans: TagSourceSpans,
     ) {
         use crate::i18n;
         let start_name = self.registry.start_tag_placeholder_name(tag, attrs, is_void);
+        self.note_original(&start_name, spans.start.clone());
         let saved_sub = self.current_sub;
         let sub = self.next_sub;
         self.next_sub += 1;
@@ -1240,6 +1349,11 @@ impl I18nCollector {
         } else {
             self.registry.close_tag_placeholder_name(tag)
         };
+        if !is_void {
+            // `placeholderToContent[closePhName].text` (the end tag as authored; a namespaced
+            // `<xhtml:div>` keeps its prefix in the goldens).
+            self.note_original(&close_name, spans.end.unwrap_or_else(|| format!("</{tag}>")));
+        }
         self.nodes.push(i18n::Node::TagPlaceholder(i18n::TagPlaceholder {
             tag: tag.to_string(),
             start_name,
@@ -1374,40 +1488,67 @@ impl I18nCollector {
     }
 
     /// An ICU expansion embedded in message content becomes an `IcuPlaceholder` (`i18n_parser.ts`
-    /// `visitExpansion`: a non-top-level ICU yields a placeholder named `ICU`/`ICU_<n>`). The inner
-    /// `Icu` carries the var/case structure recovered from the r3 ICU node; full ICU-case
-    /// serialization (`icu_serializer.ts`) is the reify boundary, so the case bodies are collected
-    /// but the raw switch expression/type are best-effort.
+    /// `visitExpansion`: a non-top-level ICU yields a placeholder named `ICU`/`ICU_<n>`, named from the
+    /// expansion's source text). Its own message (`placeholderToMessage`, the `[Icu]` message the
+    /// render3 transform attached to the expansion) is recorded as a sub-message of the enclosing
+    /// message, and its `VAR_<type>` expressions become postprocessing params of that sub-message
+    /// (`ingestIcu` / `i18n_text_extraction.ts`).
     fn visit_icu(&mut self, icu: &Icu) {
         use crate::i18n;
-        let name = self.registry.placeholder_name("ICU", "");
-        let inner = i18n::Icu {
-            expression: String::new(),
-            icu_type: String::new(),
-            cases: Vec::new(),
-            expression_placeholder: None,
+        let Some(t::I18nMeta::Message(message)) = &icu.i18n else {
+            return;
         };
-        // Record the var expressions of the ICU so they still flow into `ɵɵi18nExp` (Angular threads
-        // the ICU's bound vars as expressions). The placeholder text/value stays the ICU sentinel.
-        for (_, bt) in &icu.vars {
-            if let AstExprKind::Interpolation { expressions, .. } = &bt.value.kind {
-                for e in expressions {
-                    let idx = self.expr_counts.entry(self.current_sub).or_insert(0);
-                    let expr_index_in_view = *idx;
-                    *idx += 1;
-                    self.exprs.push(I18nInterpolation {
-                        expr: e.clone(),
-                        placeholder_name: name.clone(),
-                        sub_template_index: self.current_sub,
-                        expr_index_in_view,
-                    });
+        let source = icu.source_span.to_source_string();
+        let name = self.registry.placeholder_name("ICU", &source);
+        let Some(i18n::Node::Icu(inner)) = message.nodes.first().cloned() else {
+            return;
+        };
+        let owner = format!("icu#{}", self.icus.len());
+        self.collect_icu_vars(icu, &owner);
+        self.nodes.push(i18n::Node::IcuPlaceholder(i18n::IcuPlaceholder {
+            value: inner,
+            name: name.clone(),
+        }));
+        self.icus.push(IcuSub {
+            name,
+            owner,
+            message: message.clone(),
+            source,
+            placeholders: icu.placeholders.clone(),
+        });
+    }
+
+    /// Record the `VAR_<type>` expressions of an ICU (`ingestIcu` ingests each var with its ICU
+    /// placeholder), in the ICU's var order, against the ICU `owner` (`None` for a bare ICU).
+    fn collect_icu_vars(&mut self, icu: &Icu, owner: &str) {
+        for (var_name, bt) in &icu.vars {
+            self.push_icu_expr(icu_var_expr(bt), var_name, owner);
+        }
+        // `ingestIcu` ingests the vars, then the placeholders, in that order: the expressions of a
+        // bound case placeholder (`{{x}}` inside a case) follow the vars.
+        for (key, ph) in &icu.placeholders {
+            if let t::IcuPlaceholder::Bound(bt) = ph {
+                if let AstExprKind::Interpolation { expressions, .. } = &bt.value.kind {
+                    for expr in expressions {
+                        self.push_icu_expr(expr.clone(), key, owner);
+                    }
                 }
             }
         }
-        self.nodes.push(i18n::Node::IcuPlaceholder(i18n::IcuPlaceholder {
-            value: inner,
-            name,
-        }));
+    }
+
+    fn push_icu_expr(&mut self, expr: AstNode, placeholder: &str, owner: &str) {
+        let idx = self.expr_counts.entry(self.current_sub).or_insert(0);
+        let expr_index_in_view = *idx;
+        *idx += 1;
+        self.exprs.push(I18nInterpolation {
+            expr,
+            placeholder_name: placeholder.to_string(),
+            sub_template_index: self.current_sub,
+            expr_index_in_view,
+            icu: Some(owner.to_string()),
+            original: None,
+        });
     }
 }
 
@@ -1419,15 +1560,72 @@ type PlaceholderRegistryShim = crate::i18n::PlaceholderRegistry;
 /// / `BlockPlaceholder` nodes of an `i18n` block, by simulating the create-op slot allocation and
 /// sub-template-index (DFS) numbering the block emission will perform.
 ///
+/// One runtime value of a tag/block placeholder: a single element/template/block marker, or the
+/// combined element + template value of a structural element (`<span *ngIf>`), which Angular
+/// serializes as one concatenated magic string (`extract_i18n_messages.ts` `formatValue` with both
+/// `ElementTag` and `TemplateTag` set).
+#[derive(Clone, Debug)]
+enum ResolvedParamValue {
+    Single(crate::i18n::I18nParamValue),
+    Combined {
+        element: crate::i18n::I18nParamValue,
+        template: crate::i18n::I18nParamValue,
+        open: bool,
+        close: bool,
+    },
+}
+
+impl ResolvedParamValue {
+    /// `formatValue` for this value.
+    fn format(&self) -> String {
+        use crate::i18n::{format_value, I18nParamValue, I18nParamValueFlags as F};
+        match self {
+            ResolvedParamValue::Single(v) => format_value(v),
+            ResolvedParamValue::Combined { element, template, open, close } => {
+                let (open, close) = (*open, *close);
+                let with = |v: &I18nParamValue, marker: F| I18nParamValue {
+                    value: v.value,
+                    sub_template_index: v.sub_template_index,
+                    flags: marker
+                        | if open { F::OPEN_TAG } else { F::NONE }
+                        | if close { F::CLOSE_TAG } else { F::NONE },
+                };
+                let e = format_value(&with(element, F::ELEMENT_TAG));
+                let t = format_value(&with(template, F::TEMPLATE_TAG));
+                if open && close {
+                    format!("{t}{e}{t}")
+                } else if close {
+                    format!("{e}{t}")
+                } else {
+                    format!("{t}{e}")
+                }
+            }
+        }
+    }
+}
+
+/// `formatParamValues` over resolved values: one value verbatim, several merged as `[a|b]`.
+fn format_resolved_param_values(values: &[ResolvedParamValue]) -> Option<String> {
+    if values.is_empty() {
+        return None;
+    }
+    let serialized: Vec<String> = values.iter().map(ResolvedParamValue::format).collect();
+    Some(if serialized.len() == 1 {
+        serialized.into_iter().next().unwrap()
+    } else {
+        format!("[{}]", serialized.join("|"))
+    })
+}
+
 /// It walks the same node tree, in the same order, with the same [`crate::i18n::PlaceholderRegistry`]
 /// as [`I18nCollector`], so the placeholder NAMES it keys sentinels by are byte-identical. For each
 /// nested element it records `#<slot>` (element marker); for each `<ng-template>` / control-flow body
 /// it records `*<slot>` (template marker) against a freshly-allocated sub-template index. Returns
 /// `None` for any shape it cannot model (so the caller can fall back to omitting sentinels).
 struct I18nSentinelResolver {
-    /// Per-placeholder-name accumulated `I18nParamValue`s, in first-seen order.
+    /// Per-placeholder-name accumulated values, in first-seen order.
     order: Vec<String>,
-    values: std::collections::HashMap<String, Vec<crate::i18n::I18nParamValue>>,
+    values: std::collections::HashMap<String, Vec<ResolvedParamValue>>,
     /// Original-code fragments per placeholder name (first-seen wins).
     original: std::collections::HashMap<String, String>,
     /// The next sub-template index to hand out (root block is `None`; first child view ⇒ 1).
@@ -1454,6 +1652,10 @@ impl I18nSentinelResolver {
         value: crate::i18n::I18nParamValue,
         original_code: String,
     ) {
+        self.record_resolved(name, ResolvedParamValue::Single(value), original_code);
+    }
+
+    fn record_resolved(&mut self, name: &str, value: ResolvedParamValue, original_code: String) {
         if !self.values.contains_key(name) {
             self.order.push(name.to_string());
             self.original.insert(name.to_string(), original_code);
@@ -1461,9 +1663,7 @@ impl I18nSentinelResolver {
         self.values.entry(name.to_string()).or_default().push(value);
     }
 
-    fn into_ordered_params(
-        self,
-    ) -> Vec<(String, Vec<crate::i18n::I18nParamValue>, String)> {
+    fn into_ordered_params(self) -> Vec<(String, Vec<ResolvedParamValue>, String)> {
         let I18nSentinelResolver {
             order,
             mut values,
@@ -1543,6 +1743,65 @@ impl I18nSentinelResolver {
                         .clone()
                         .unwrap_or_else(|| "ng-template".to_string());
                     let attrs = static_attr_pairs(&tmpl.attributes);
+                    // A structural directive on an element (`<span *ngIf>`): the html element is the one
+                    // placeholder, and its value combines the element (inside the new view) and the
+                    // template (the host slot in this view). Mirrors the collector's desugared arm.
+                    let desugared = match tmpl.children.as_slice() {
+                        [Node::Element(el)] if tag != "ng-template" && el.name == tag => {
+                            Some((el.is_void, el.references.len(), el.children.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((is_void, refs, el_children)) = desugared {
+                        use crate::i18n::I18nParamValueFlags as F;
+                        let host_slot = *slot;
+                        *slot += 1 + tmpl.references.len();
+                        let start = reg.start_tag_placeholder_name(&tag, &attrs, is_void);
+                        let sub = self.next_sub_template_index;
+                        self.next_sub_template_index += 1;
+                        // The element is the first create op of its own view (slot 1).
+                        let element_slot = 1usize;
+                        let mut child_slot = element_slot + 1 + refs;
+                        self.resolve_in_view(&el_children, reg, &mut child_slot, Some(sub))?;
+                        let close = if is_void {
+                            None
+                        } else {
+                            Some(reg.close_tag_placeholder_name(&tag))
+                        };
+                        let element = crate::i18n::I18nParamValue {
+                            value: element_slot,
+                            sub_template_index: Some(sub),
+                            flags: F::ELEMENT_TAG,
+                        };
+                        let template = crate::i18n::I18nParamValue {
+                            value: host_slot,
+                            sub_template_index: Some(sub),
+                            flags: F::TEMPLATE_TAG,
+                        };
+                        self.record_resolved(
+                            &start,
+                            ResolvedParamValue::Combined {
+                                element: element.clone(),
+                                template: template.clone(),
+                                open: true,
+                                close: is_void,
+                            },
+                            format!("<{tag}>"),
+                        );
+                        if let Some(close) = close {
+                            self.record_resolved(
+                                &close,
+                                ResolvedParamValue::Combined {
+                                    element: element.clone(),
+                                    template: template.clone(),
+                                    open: false,
+                                    close: true,
+                                },
+                                format!("</{tag}>"),
+                            );
+                        }
+                        continue;
+                    }
                     // The host slot is in THIS view; its `#ref`s each take a slot. Its children are a
                     // sub-template (new view, new sub-template index, slot counter restarts at 1).
                     let host_slot = *slot;
@@ -1860,8 +2119,12 @@ impl I18nSentinelResolver {
                         self.resolve_in_view(&er.children, reg, &mut cs, Some(sub))?;
                     }
                 }
-                // Remaining shapes (ICU expansions, etc.) are not modelled here; bail so the caller
-                // omits sentinels rather than emit wrong ones.
+                // An ICU expansion owns no create op of its own (`ingestIcu`'s IcuStart/IcuEnd and the
+                // text ops of its vars and cases are removed by the i18n phases), so it reserves no slot
+                // and records no placeholder value in the enclosing block.
+                Node::Icu(_) => {}
+                // Remaining shapes are not modelled here; bail so the caller omits sentinels rather than
+                // emit wrong ones.
                 _ => return None,
             }
         }
@@ -1930,6 +2193,105 @@ fn static_attr_pairs(attrs: &[TextAttribute]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The authored `{{ … }}` interpolations of a text's source, in order: each `{{` up to and including its
+/// closing `}}` (the `sourceSpan` of an interpolation placeholder in `i18n_parser.ts`).
+fn interpolation_source_pieces(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        out.push(format!("{{{{{}}}}}", &after[..end]));
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+/// The switch expression of an ICU variable. `parseInterpolationExpression` wraps it in an
+/// interpolation whose single expression is the expression itself (`r3_template_transform.ts`).
+fn icu_var_expr(bt: &t::BoundText) -> AstNode {
+    match &bt.value.kind {
+        AstExprKind::Interpolation { expressions, .. } if expressions.len() == 1 => {
+            expressions[0].clone()
+        }
+        _ => bt.value.clone(),
+    }
+}
+
+/// The runtime magic value of one collected interpolation: `�n�` at the root, `�n:subTemplateIndex�`
+/// inside a sub-template (Angular `formatValue` with `ExpressionIndex` + a context marker). `n` is the
+/// expression's index WITHIN its view.
+fn interpolation_runtime_value(ie: &I18nInterpolation) -> String {
+    match ie.sub_template_index {
+        None => format!("\u{FFFD}{}\u{FFFD}", ie.expr_index_in_view),
+        Some(sub) => format!("\u{FFFD}{}:{}\u{FFFD}", ie.expr_index_in_view, sub),
+    }
+}
+
+/// The postprocessing params of one ICU message (`owner = Some(name)`) or of a bare ICU's message
+/// (`owner = None`), as `ir.I18nParamResolutionTime.Postprocessing` resolves them
+/// (`extract_i18n_messages.ts` `formatIcuPlaceholder` / `formatParams`):
+///   - each `VAR_<type>` maps to its runtime value(s); several values for one variable merge into the
+///     `[a|b]` form (`placeholderValuesToParam`),
+///   - each case placeholder (a tag, block or text of a case) maps to its own text, and a bound case
+///     placeholder to its strings with the runtime value of each expression in place.
+fn icu_postprocess_params(
+    owner: &str,
+    placeholders: &[(String, t::IcuPlaceholder)],
+    exprs: &[I18nInterpolation],
+) -> Vec<(String, crate::i18n::I18nPostprocessValue)> {
+    use crate::i18n::I18nPostprocessValue as PV;
+    let belongs = |ie: &&I18nInterpolation| ie.icu.as_deref() == Some(owner);
+    let mut params: Vec<(String, crate::i18n::I18nPostprocessValue)> = Vec::new();
+    // The variables (`VAR_<type>`): the interpolation expressions that are not a case placeholder.
+    let mut order: Vec<String> = Vec::new();
+    let mut values: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for ie in exprs.iter().filter(belongs) {
+        if placeholders.iter().any(|(key, _)| *key == ie.placeholder_name) {
+            continue;
+        }
+        if !values.contains_key(&ie.placeholder_name) {
+            order.push(ie.placeholder_name.clone());
+        }
+        values
+            .entry(ie.placeholder_name.clone())
+            .or_default()
+            .push(interpolation_runtime_value(ie));
+    }
+    for name in order {
+        let value = crate::i18n::placeholder_values_to_param(&values[&name]);
+        params.push((name, PV::Literal(value)));
+    }
+    for (key, ph) in placeholders {
+        match ph {
+            t::IcuPlaceholder::Text(text) => {
+                params.push((key.clone(), PV::Literal(text.value.clone())))
+            }
+            t::IcuPlaceholder::Bound(bt) => {
+                let strings: Vec<String> = match &bt.value.kind {
+                    AstExprKind::Interpolation { strings, .. } => strings.clone(),
+                    _ => Vec::new(),
+                };
+                let runtime: Vec<String> = exprs
+                    .iter()
+                    .filter(belongs)
+                    .filter(|ie| ie.placeholder_name == *key)
+                    .map(interpolation_runtime_value)
+                    .collect();
+                let mut value = String::new();
+                for (i, string) in strings.iter().enumerate() {
+                    value.push_str(string);
+                    if let Some(v) = runtime.get(i) {
+                        value.push_str(v);
+                    }
+                }
+                params.push((key.clone(), PV::Literal(value)));
+            }
+        }
+    }
+    params
+}
+
 /// Whether a child of an `i18n`-marked element emits its OWN create-time op that must be bracketed
 /// inside the i18n block — forcing the open/close `ɵɵi18nStart`/`ɵɵi18nEnd` pair rather than the
 /// collapsed single `ɵɵi18n` instruction (Angular `reify.ts`: a block with no bracketed child create
@@ -1943,7 +2305,6 @@ fn node_emits_i18n_child_create_op(node: &Node) -> bool {
             | Node::Template(_)
             | Node::Component(_)
             | Node::Content(_)
-            | Node::Icu(_)
             | Node::DeferredBlock(_)
             | Node::SwitchBlock(_)
             | Node::ForLoopBlock(_)
@@ -1961,15 +2322,24 @@ fn i18n_original_code(node: &AstNode) -> String {
     format!("{{{{{}}}}}", ast_to_source(node))
 }
 
+/// The lookups the `$localize` walk needs: the param value of each placeholder name (and whether it
+/// is a variable reference), the sub-message each ICU placeholder refers to (`associatedMessage`),
+/// and the span used for every emitted piece.
+struct LocalizeWalkCtx<'a> {
+    params: &'a std::collections::HashMap<String, (String, bool)>,
+    sub_messages: &'a std::collections::HashMap<String, std::rc::Rc<o::Message>>,
+    no_span: &'a o::ParseSourceSpan,
+}
+
 /// Recursively walk i18n message nodes producing the `$localize` `messageParts` / `placeholders` /
 /// `expressions` triples. A `Placeholder`/`IcuPlaceholder` emits one piece (its public name, value
-/// looked up by NAME); a `TagPlaceholder`/`BlockPlaceholder` emits a start piece, then its children,
-/// then a close piece — mirroring `LocalizeMessageStringVisitor` over the same param map.
-#[allow(clippy::too_many_arguments)]
+/// looked up by NAME; an ICU placeholder also carries its sub-message, which the emitter turns into
+/// the `@@<id>` of the meta block); a `TagPlaceholder`/`BlockPlaceholder` emits a start piece, then
+/// its children, then a close piece. An `Icu` node is literal text (`serializeIcuNode`), as in
+/// `LocalizeSerializerVisitor.visitIcu`.
 fn i18n_localize_walk(
     nodes: &[crate::i18n::Node],
-    param_by_name: &std::collections::HashMap<String, String>,
-    no_span: &o::ParseSourceSpan,
+    ctx: &LocalizeWalkCtx<'_>,
     pending: &mut String,
     message_parts: &mut Vec<o::LiteralPiece>,
     placeholders: &mut Vec<o::PlaceholderPiece>,
@@ -1977,69 +2347,62 @@ fn i18n_localize_walk(
 ) {
     use crate::i18n;
     let push_ph = |name: &str,
+                   assoc: Option<std::rc::Rc<o::Message>>,
                    pending: &mut String,
                    message_parts: &mut Vec<o::LiteralPiece>,
                    placeholders: &mut Vec<o::PlaceholderPiece>,
-                       expressions: &mut Vec<o::Expr>| {
+                   expressions: &mut Vec<o::Expr>| {
         message_parts.push(o::LiteralPiece {
             text: std::mem::take(pending),
-            source_span: no_span.clone(),
+            source_span: ctx.no_span.clone(),
         });
         placeholders.push(o::PlaceholderPiece {
             text: i18n::format_i18n_placeholder_name(name, false),
-            source_span: no_span.clone(),
-            associated_message: None,
+            source_span: ctx.no_span.clone(),
+            associated_message: assoc,
         });
-        let value = param_by_name.get(name).cloned().unwrap_or_default();
-        expressions.push(o::literal(o::LiteralValue::String(value), None));
+        let value = match ctx.params.get(name) {
+            Some((value, true)) => o::variable(value.clone(), None),
+            Some((value, false)) => o::literal(o::LiteralValue::String(value.clone()), None),
+            None => o::literal(o::LiteralValue::String(String::new()), None),
+        };
+        expressions.push(value);
     };
     for node in nodes {
         match node {
             i18n::Node::Text(t) => pending.push_str(&t.value),
-            i18n::Node::Placeholder(ph) => {
-                push_ph(&ph.name, pending, message_parts, placeholders, expressions)
-            }
-            i18n::Node::IcuPlaceholder(ph) => {
-                push_ph(&ph.name, pending, message_parts, placeholders, expressions)
-            }
-            i18n::Node::TagPlaceholder(ph) => {
-                push_ph(&ph.start_name, pending, message_parts, placeholders, expressions);
-                i18n_localize_walk(
-                    &ph.children,
-                    param_by_name,
-                    no_span,
-                    pending,
-                    message_parts,
-                    placeholders,
-                    expressions,
-                );
-                if !ph.is_void {
-                    push_ph(&ph.close_name, pending, message_parts, placeholders, expressions);
-                }
-            }
-            i18n::Node::BlockPlaceholder(ph) => {
-                push_ph(&ph.start_name, pending, message_parts, placeholders, expressions);
-                i18n_localize_walk(
-                    &ph.children,
-                    param_by_name,
-                    no_span,
-                    pending,
-                    message_parts,
-                    placeholders,
-                    expressions,
-                );
-                push_ph(&ph.close_name, pending, message_parts, placeholders, expressions);
-            }
-            i18n::Node::Container(c) => i18n_localize_walk(
-                &c.children,
-                param_by_name,
-                no_span,
+            i18n::Node::Placeholder(ph) => push_ph(
+                &ph.name,
+                None,
                 pending,
                 message_parts,
                 placeholders,
                 expressions,
             ),
-            i18n::Node::Icu(_) => {}
+            i18n::Node::IcuPlaceholder(ph) => push_ph(
+                &ph.name,
+                ctx.sub_messages.get(&ph.name).cloned(),
+                pending,
+                message_parts,
+                placeholders,
+                expressions,
+            ),
+            i18n::Node::TagPlaceholder(ph) => {
+                push_ph(&ph.start_name, None, pending, message_parts, placeholders, expressions);
+                i18n_localize_walk(&ph.children, ctx, pending, message_parts, placeholders, expressions);
+                if !ph.is_void {
+                    push_ph(&ph.close_name, None, pending, message_parts, placeholders, expressions);
+                }
+            }
+            i18n::Node::BlockPlaceholder(ph) => {
+                push_ph(&ph.start_name, None, pending, message_parts, placeholders, expressions);
+                i18n_localize_walk(&ph.children, ctx, pending, message_parts, placeholders, expressions);
+                push_ph(&ph.close_name, None, pending, message_parts, placeholders, expressions);
+            }
+            i18n::Node::Container(c) => {
+                i18n_localize_walk(&c.children, ctx, pending, message_parts, placeholders, expressions)
+            }
+            i18n::Node::Icu(icu) => pending.push_str(&i18n::serialize_icu_node(icu)),
         }
     }
 }
@@ -2902,6 +3265,11 @@ pub struct TemplateDefinitionBuilder {
     /// `ɵɵi18n(0, msgIndex, subTemplateIndex)` when it has no further bracketed child create ops).
     /// Mirrors Angular's `propagateI18nBlocks` sub-template threading.
     i18n_child_view: Option<I18nChildView>,
+    /// The i18n message of an explicit `<ng-template i18n>`: the view's whole content is one i18n block
+    /// rooted at the view (`ɵɵi18n(0, msg)`), not an i18n sub-template of a parent message.
+    root_i18n_block: Option<t::I18nMeta>,
+    /// Set by the parent `<ng-template>` for the next nested view built (see `root_i18n_block`).
+    pending_root_i18n_block: Option<t::I18nMeta>,
     /// Set when THIS view is currently emitting the create ops of an `i18n` block: child elements,
     /// templates and control-flow blocks reached during the walk are bracketed inside the open
     /// `ɵɵi18nStart`/`ɵɵi18nEnd` pair, and any child VIEW they spawn (`@for` body, `<ng-template>`,
@@ -3011,6 +3379,8 @@ impl TemplateDefinitionBuilder {
             has_default_projection: false,
             dom_only: input.dom_only,
             i18n_child_view: None,
+            root_i18n_block: None,
+            pending_root_i18n_block: None,
             i18n_block_ctx: None,
             in_i18n_create: false,
             active_namespace: Namespace::Html,
@@ -3771,7 +4141,15 @@ impl TemplateDefinitionBuilder {
         // data slot `0` for its i18n block, brackets its create ops between `ɵɵi18nStart(0, msg,
         // subIdx)` … `ɵɵi18nEnd()` (collapsing to `ɵɵi18n(0, msg, subIdx)` when nothing nested
         // brackets create ops), and emits its interpolation operands (`ɵɵi18nExp` + `ɵɵi18nApply(0)`).
-        if let Some(child) = self.i18n_child_view.clone() {
+        if let Some(meta) = self.root_i18n_block.take() {
+            // `<ng-template i18n>`: the view's whole content is the i18n block (`i18n_parser.ts`
+            // `visitElement` over the template element, whose children form the message).
+            let message = match &meta {
+                t::I18nMeta::Message(m) => Some(m.clone()),
+                _ => None,
+            };
+            self.build_i18n_block(&nodes, message.as_ref());
+        } else if let Some(child) = self.i18n_child_view.clone() {
             self.build_i18n_child_view(&child, &nodes);
         } else {
             self.visit_all(&nodes);
@@ -4852,9 +5230,26 @@ impl TemplateDefinitionBuilder {
         // (update-only, no message contribution). Placeholder names come from the ported
         // [`i18n::PlaceholderRegistry`], so the serialized `$localize`/`goog.getMsg` string and the
         // decimal-digest message id match Angular byte-for-byte.
+        // A bare ICU (an expansion outside any i18n block) is its own i18n block (`wrapI18nIcus`), and
+        // its message IS the ICU message (`icu.i18n`), not a placeholder around it.
+        let bare_icu = match children {
+            [Node::Icu(icu)] => match &icu.i18n {
+                Some(t::I18nMeta::Message(m)) => Some((icu, m)),
+                _ => None,
+            },
+            _ => None,
+        };
         let mut collector = I18nCollector::new();
-        collector.visit_children(children);
-        let I18nCollector { nodes, exprs, .. } = collector;
+        let (nodes, exprs, icus, originals) = if let Some((icu, _)) = bare_icu {
+            collector.collect_icu_vars(icu, "");
+            let I18nCollector { exprs, .. } = collector;
+            let nodes = bare_icu.map(|(_, m)| m.nodes.clone()).unwrap_or_default();
+            (nodes, exprs, Vec::new(), std::collections::HashMap::new())
+        } else {
+            collector.visit_children(children);
+            let I18nCollector { nodes, exprs, icus, originals, .. } = collector;
+            (nodes, exprs, icus, originals)
+        };
 
         // `@let` declarations among an i18n block's children contribute nothing to the message
         // (`i18n_parser.ts` `visitLetDeclaration` returns `null`) but are still real update-block
@@ -4885,7 +5280,15 @@ impl TemplateDefinitionBuilder {
         let (meaning, description, custom_id) = meta
             .map(|m| (m.meaning.clone(), m.description.clone(), m.custom_id.clone()))
             .unwrap_or_default();
-        let message = i18n::Message::new(nodes, meaning, description, custom_id);
+        let mut message = i18n::Message::new(nodes, meaning, description, custom_id);
+        if let (Some((_, icu_message)), None) = (bare_icu, meta) {
+            // A bare ICU outside any i18n element keeps the metadata of its own message. Inside an
+            // i18n element whose only child is the ICU, the element's metadata wins (`meta.ts`
+            // `visitExpansion`: `currentMessage || meta`).
+            message.meaning = icu_message.meaning.clone();
+            message.description = icu_message.description.clone();
+            message.custom_id = icu_message.custom_id.clone();
+        }
 
         // Build the interpolation placeholder params (`I18nMessageOp.params`): each interpolation maps
         // its public placeholder name to the runtime magic string `\u{FFFD}<index>\u{FFFD}` plus the
@@ -4910,21 +5313,21 @@ impl TemplateDefinitionBuilder {
         let mut order: Vec<String> = Vec::new();
         let mut values_by_name: std::collections::HashMap<String, (Vec<String>, String)> =
             std::collections::HashMap::new();
-        for ie in exprs.iter() {
+        // The `VAR_<type>` expressions of an ICU belong to that ICU's message, not to this one.
+        for ie in exprs.iter().filter(|ie| ie.icu.is_none()) {
             let entry = values_by_name
                 .entry(ie.placeholder_name.clone())
                 .or_insert_with(|| {
                     order.push(ie.placeholder_name.clone());
-                    (Vec::new(), i18n_original_code(&ie.expr))
+                    (
+                        Vec::new(),
+                        ie.original.clone().unwrap_or_else(|| i18n_original_code(&ie.expr)),
+                    )
                 });
             // The runtime expression-index value: `�n�` at the root, `�n:subTemplateIndex�` inside a
             // sub-template (Angular `formatValue` with `ExpressionIndex` + a context marker). `n` is
             // the expression's index WITHIN its view.
-            let value = match ie.sub_template_index {
-                None => format!("\u{FFFD}{}\u{FFFD}", ie.expr_index_in_view),
-                Some(sub) => format!("\u{FFFD}{}:{}\u{FFFD}", ie.expr_index_in_view, sub),
-            };
-            entry.0.push(value);
+            entry.0.push(interpolation_runtime_value(ie));
         }
         let mut params: Vec<i18n::I18nPlaceholderParam> = order
             .into_iter()
@@ -4934,6 +5337,7 @@ impl TemplateDefinitionBuilder {
                     name,
                     value: i18n::placeholder_values_to_param(values),
                     original_code: original_code.clone(),
+                    var_ref: false,
                 }
             })
             .collect();
@@ -4964,10 +5368,13 @@ impl TemplateDefinitionBuilder {
                 .is_some()
             {
                 for (name, values, original_code) in resolver.into_ordered_params() {
+                    // The authored tag source (`startSourceSpan`) wins over the resolver's `<tag>` form.
+                    let original_code = originals.get(&name).cloned().unwrap_or(original_code);
                     sentinel_params.push(i18n::I18nPlaceholderParam {
                         name,
-                        value: i18n::format_param_values(&values).unwrap_or_default(),
+                        value: format_resolved_param_values(&values).unwrap_or_default(),
                         original_code,
+                        var_ref: false,
                     });
                 }
             } else {
@@ -4990,7 +5397,55 @@ impl TemplateDefinitionBuilder {
             }
         }
 
-        let const_index = self.intern_i18n_message(&message, &params);
+        // The ICU sub-messages of this block (`collectMessage`): each ICU's message is interned first
+        // (its `VAR_<type>` values are postprocessing params of that message), and the parent gets the
+        // sub-message variable under the ICU's placeholder name (`addSubMessageParams`).
+        //
+        // `addSubMessageParams`: one sub-message under a placeholder is the param's variable; several
+        // sub-messages sharing a placeholder (identical ICUs) are selected at runtime, so the param is
+        // `\uFFFDI18N_EXP_<name>\uFFFD` and the postprocessing param is the array of their variables.
+        let mut sub_messages: Vec<(String, crate::i18n::Message)> = Vec::new();
+        let mut postprocess: Vec<(String, crate::i18n::I18nPostprocessValue)> = Vec::new();
+        if bare_icu.is_none() {
+            let mut sub_vars: Vec<(String, Vec<String>)> = Vec::new();
+            for icu in &icus {
+                let icu_postprocess = icu_postprocess_params(&icu.owner, &icu.placeholders, &exprs);
+                let var = self.intern_i18n_icu_message(&icu.message, icu_postprocess);
+                match sub_vars.iter_mut().find(|(name, _)| *name == icu.name) {
+                    Some((_, vars)) => vars.push(var),
+                    None => sub_vars.push((icu.name.clone(), vec![var])),
+                }
+                sub_messages.push((icu.name.clone(), icu.message.clone()));
+            }
+            for (name, vars) in sub_vars {
+                let source = icus
+                    .iter()
+                    .find(|icu| icu.name == name)
+                    .map(|icu| icu.source.clone())
+                    .unwrap_or_default();
+                if vars.len() == 1 {
+                    params.push(i18n::I18nPlaceholderParam {
+                        name,
+                        value: vars[0].clone(),
+                        original_code: source,
+                        var_ref: true,
+                    });
+                } else {
+                    params.push(i18n::I18nPlaceholderParam {
+                        name: name.clone(),
+                        value: format!("\u{FFFD}I18N_EXP_{name}\u{FFFD}"),
+                        original_code: source,
+                        var_ref: false,
+                    });
+                    postprocess.push((name, crate::i18n::I18nPostprocessValue::Vars(vars)));
+                }
+            }
+        }
+        // A bare ICU's own message carries its `VAR_<type>` values as postprocessing params.
+        if let Some((icu, _)) = bare_icu {
+            postprocess = icu_postprocess_params("", &icu.placeholders, &exprs);
+        }
+        let const_index = self.intern_i18n_message(&message, &params, &sub_messages, postprocess);
 
         // Within this i18n block the relevant `@let`-usage scope is the block's OWN children (the
         // `@let` declarations sit nested under the i18n host element, not at the view's top level).
@@ -5153,6 +5608,23 @@ impl TemplateDefinitionBuilder {
                 },
                 Node::Element(el) => self.collect_child_i18n_interps_rec(&el.children, out),
                 Node::Component(c) => self.collect_child_i18n_interps_rec(&c.children, out),
+                // An ICU inside an i18n child view contributes its `VAR_<type>` expressions, then the
+                // expressions of its bound case placeholders (`ingestIcu` order), to the view's
+                // `ɵɵi18nExp` operands.
+                Node::Icu(icu) => {
+                    for (_, bt) in &icu.vars {
+                        out.push(self.make_child_interp(&icu_var_expr(bt)));
+                    }
+                    for (_, ph) in &icu.placeholders {
+                        if let t::IcuPlaceholder::Bound(bt) = ph {
+                            if let AstExprKind::Interpolation { expressions, .. } = &bt.value.kind {
+                                for e in expressions {
+                                    out.push(self.make_child_interp(e));
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -5203,7 +5675,10 @@ impl TemplateDefinitionBuilder {
 
         if !child.interpolations.is_empty() {
             self.allocate_binding_slots(child.interpolations.len());
-            self.advance_to(i18n_slot);
+            // As for the root block: the bindings apply at the last data slot the view's create ops
+            // reserved (`_currentIndex` after the create walk), never below the i18n anchor.
+            let advance_target = (self.data_index.saturating_sub(1)).max(i18n_slot);
+            self.advance_to(advance_target);
             self.current_target_slot = i18n_slot;
             for interp in &child.interpolations {
                 let lowered = if let Some((name, slot)) = &interp.cross_view_let {
@@ -5252,18 +5727,35 @@ impl TemplateDefinitionBuilder {
         &mut self,
         message: &crate::i18n::Message,
         params: &[crate::i18n::I18nPlaceholderParam],
+        sub_messages: &[(String, crate::i18n::Message)],
+        postprocess: Vec<(String, crate::i18n::I18nPostprocessValue)>,
     ) -> usize {
-        let (i18n_const, _) = self.build_i18n_message_const(message, params);
+        let (i18n_const, _) =
+            self.build_i18n_message_const(message, params, sub_messages, postprocess);
         self.const_pool
             .borrow_mut()
             .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
+    }
+
+    /// Intern the message of an ICU nested in an i18n message (`ingestIcu` / `collectMessage`): its
+    /// statements are emitted as initializers (no `consts` entry, the parent reads the variable), and
+    /// the variable name `i18n_<n>` is returned. Sub-messages are interned before their parent, so the
+    /// numbering matches Angular's `collectMessage` (children first).
+    fn intern_i18n_icu_message(
+        &mut self,
+        message: &crate::i18n::Message,
+        postprocess: Vec<(String, crate::i18n::I18nPostprocessValue)>,
+    ) -> String {
+        let (i18n_const, index) = self.build_i18n_message_const(message, &[], &[], postprocess);
+        self.const_pool.borrow_mut().add_initializers(i18n_const.initializers);
+        format!("i18n_{index}")
     }
 
     /// The `let`/`if` initializers of a static `i18n-<attr>` message (`i18n_const_collection.ts`, the
     /// attribute case). They are emitted, but the message is NOT a `consts` entry: the attribute array
     /// reads it as `i18n_<index>`. Returns that name index.
     fn intern_i18n_attr_message(&mut self, message: &crate::i18n::Message) -> usize {
-        let (i18n_const, index) = self.build_i18n_message_const(message, &[]);
+        let (i18n_const, index) = self.build_i18n_message_const(message, &[], &[], Vec::new());
         self.const_pool.borrow_mut().add_initializers(i18n_const.initializers);
         index
     }
@@ -5274,6 +5766,8 @@ impl TemplateDefinitionBuilder {
         &mut self,
         message: &crate::i18n::Message,
         params: &[crate::i18n::I18nPlaceholderParam],
+        sub_messages: &[(String, crate::i18n::Message)],
+        postprocess: Vec<(String, crate::i18n::I18nPostprocessValue)>,
     ) -> (crate::i18n::I18nConst, usize) {
         use crate::i18n;
 
@@ -5296,8 +5790,28 @@ impl TemplateDefinitionBuilder {
         let no_span = o::ParseSourceSpan::synthetic();
         let mut param_by_name = std::collections::HashMap::new();
         for p in params {
-            param_by_name.insert(p.name.clone(), p.value.clone());
+            param_by_name.insert(p.name.clone(), (p.value.clone(), p.var_ref));
         }
+        // The sub-message of each ICU placeholder (`placeholderToMessage`), shared by the `$localize`
+        // placeholder pieces (their `@@<id>` meta).
+        let sub_message_by_name: std::collections::HashMap<String, std::rc::Rc<o::Message>> = sub_messages
+            .iter()
+            .map(|(name, sub)| {
+                (
+                    name.clone(),
+                    std::rc::Rc::new(o::Message {
+                        message_string: sub.message_string(),
+                        meaning: (!sub.meaning.is_empty()).then(|| sub.meaning.clone()),
+                        legacy_ids: Vec::new(),
+                    }),
+                )
+            })
+            .collect();
+        let walk_ctx = LocalizeWalkCtx {
+            params: &param_by_name,
+            sub_messages: &sub_message_by_name,
+            no_span: &no_span,
+        };
 
         // Walk the message nodes (recursively, so tag/block placeholders contribute their start
         // placeholder, their children, then their close placeholder): `Text` → a literal part,
@@ -5308,8 +5822,7 @@ impl TemplateDefinitionBuilder {
         let mut pending = String::new();
         i18n_localize_walk(
             &message.nodes,
-            &param_by_name,
-            &no_span,
+            &walk_ctx,
             &mut pending,
             &mut message_parts,
             &mut placeholders,
@@ -5328,11 +5841,10 @@ impl TemplateDefinitionBuilder {
         // the params by that camel key here so `build_i18n_const` emits the maps in golden order; the
         // `$localize` substitutions were already collected in message order above (so this re-sort
         // does not affect them).
+        // `collectMessage` sorts `messageOp.params` by their RAW placeholder names (`[...entries].sort()`),
+        // and the camel-casing that follows keeps that order.
         let mut sorted_params = params.to_vec();
-        sorted_params.sort_by(|a, b| {
-            i18n::format_i18n_placeholder_name(&a.name, true)
-                .cmp(&i18n::format_i18n_placeholder_name(&b.name, true))
-        });
+        sorted_params.sort_by(|a, b| a.name.cmp(&b.name));
 
         // The message's const ordinal — Angular numbers `i18n_n` from the const-array position.
         let index = self.const_pool.borrow_mut().next_i18n_name_index();
@@ -5355,6 +5867,7 @@ impl TemplateDefinitionBuilder {
             i18n::I18nConstOpts {
                 bare_name,
                 needs_postprocess,
+                postprocess_params: postprocess,
                 // `fileBasedI18nSuffix` = `relativeContextFilePath.replace(/[^A-Za-z0-9]/g, '_')`
                 // upper-cased + `'_'`. The metadata's context file path is empty in every current
                 // emit path, so the suffix is `"_"` (→ closure prefix `MSG__`), matching the oracle.
@@ -6033,6 +6546,11 @@ impl TemplateDefinitionBuilder {
                 ctx_key: Some(var.value.clone()),
             });
         }
+        // An explicit `<ng-template i18n>` makes its own view an i18n block (see `root_i18n_block`).
+        let explicit_template = template.tag_name.as_deref().map_or(true, |t| t == "ng-template");
+        if explicit_template && tmpl_child_i18n.is_none() {
+            self.pending_root_i18n_block = template.i18n.clone();
+        }
         let (fn_ref, decls, vars) = self.build_embedded_view_i18n(
             fn_name,
             template.children.clone(),
@@ -6291,6 +6809,7 @@ impl TemplateDefinitionBuilder {
         nested.view_seq = self.const_pool.borrow_mut().alloc_view_seq();
         nested.ancestor_vars = self.ancestor_vars_for_child();
         nested.i18n_child_view = i18n_child_view;
+        nested.root_i18n_block = self.pending_root_i18n_block.take();
         // An embedded view is never the root: its hoisted descendant fns bubble up to the root
         // (below) rather than being inlined into this view body, so each is emitted exactly once.
         nested.is_root = false;
@@ -7752,6 +8271,16 @@ impl Visitor for TemplateDefinitionBuilder {
 
     fn visit_boundary_block(&mut self, block: &BoundaryBlock) {
         self.build_boundary_block(block);
+    }
+
+    // A bare ICU (an expansion outside any i18n block) is lowered as its own i18n block
+    // (`wrapI18nIcus`). An ICU inside an i18n block is only a placeholder of that block's message, so
+    // it emits nothing here (its create op is removed by the i18n phases).
+    fn visit_icu(&mut self, icu: &Icu) {
+        if self.i18n_block_ctx.is_none() && matches!(icu.i18n, Some(t::I18nMeta::Message(_))) {
+            let node = Node::Icu(icu.clone());
+            self.build_i18n_block(std::slice::from_ref(&node), None);
+        }
     }
 }
 
@@ -12849,6 +13378,109 @@ mod tests {
 
         let two_roots = vec![svg.clone(), svg];
         assert_eq!(emit_expression(&single_root_tag(&two_roots, &[])).trim(), "null;");
+    }
+
+    // ----- ICU expansions (`ingestIcu`, `wrapI18nIcus`, `extract_i18n_messages.ts`) -------------------
+
+    /// A bare ICU (outside any i18n element) is its own i18n block: `ɵɵi18n` with the ICU message as
+    /// the const, its `VAR_<type>` as a postprocessing param, and `ɵɵi18nExp`/`ɵɵi18nApply` for the
+    /// switch expression (`wrap_icus.ts`, `icu_only.js` golden).
+    #[test]
+    fn bare_icu_is_wrapped_in_its_own_i18n_block() {
+        let src = "{age, select, 10 {ten} other {other}}";
+        let out = compile_template_html(src, "C", false);
+        assert!(out.contains("\u{0275}\u{0275}i18n(0, 0)"), "missing ɵɵi18n(0, 0), got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}i18nStart("), "unexpected ɵɵi18nStart, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18nExp(ctx.age)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18nApply(0)"), "got: {out}");
+        let consts = compile_template_consts(src);
+        assert!(
+            consts.contains(r#"goog.getMsg("{VAR_SELECT, select, 10 {ten} other {other}}")"#),
+            "ICU message string, got: {consts}"
+        );
+        assert!(
+            consts.contains(r#"i18nPostprocess(i18n_0, { "VAR_SELECT": "�0�" })"#),
+            "VAR_SELECT postprocessing param, got: {consts}"
+        );
+    }
+
+    /// An ICU inside an i18n element is a placeholder of the element's message, `{$icu}`, whose value is
+    /// the ICU's own message variable and whose `$localize` form carries the ICU's message id
+    /// (`:ICU@@<id>:`). The element stays a single `ɵɵi18n` (the ICU has no create op of its own).
+    #[test]
+    fn icu_inside_i18n_element_is_a_sub_message_placeholder() {
+        let src = "<div i18n>before {g, select, male {male} female {female} other {other}} after</div>";
+        let out = compile_template_html(src, "C", false);
+        assert!(out.contains("\u{0275}\u{0275}i18n(1, 0)"), "got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}i18nStart("), "unexpected ɵɵi18nStart, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18nExp(ctx.g)"), "got: {out}");
+        let consts = compile_template_consts(src);
+        assert!(consts.contains(r#"goog.getMsg("before {$icu} after", { "icu": i18n_0 }"#), "got: {consts}");
+        assert!(consts.contains("${i18n_0}:ICU@@7670372064920373295: after"), "got: {consts}");
+        // The sub-message is interned before the root (its initializers come first).
+        let sub = consts.find("goog.getMsg(\"{VAR_SELECT").expect("sub message");
+        let root = consts.find("goog.getMsg(\"before").expect("root message");
+        assert!(sub < root, "sub-message must precede its parent, got: {consts}");
+    }
+
+    /// The tag content of an ICU case (`<strong>…</strong>`) is a postprocessing param of the ICU message,
+    /// valued by the tag's authored text (`root_icu_with_elements` golden).
+    #[test]
+    fn icu_case_tags_are_postprocessing_params() {
+        let consts = compile_template_consts("{g, select, WEBSITE {<strong>x</strong>} other {y}}");
+        assert!(
+            consts.contains(r#""CLOSE_TAG_STRONG": "</strong>""#),
+            "close tag param, got: {consts}"
+        );
+        assert!(
+            consts.contains(r#""START_TAG_STRONG": "<strong>""#),
+            "start tag param, got: {consts}"
+        );
+        assert!(consts.contains(r#""VAR_SELECT": "�0�""#), "got: {consts}");
+    }
+
+    /// Two identical ICUs in one i18n element share one placeholder: the parent reads the runtime choice
+    /// `�I18N_EXP_ICU�`, and the postprocessing step picks among the sub-message variables
+    /// (`addSubMessageParams`, `shared_placeholder` golden).
+    #[test]
+    fn repeated_icu_placeholder_selects_among_its_sub_messages() {
+        let consts = compile_template_consts(
+            "<div i18n>{g, select, male {male} other {o}} {g, select, male {male} other {o}}</div>",
+        );
+        assert!(consts.contains(r#""icu": "�I18N_EXP_ICU�""#) || consts.contains(r#""ICU": "�I18N_EXP_ICU�""#) || consts.contains(r#"�I18N_EXP_ICU�"#), "got: {consts}");
+        assert!(
+            consts.contains(r#""ICU": [i18n_0, i18n_1]"#),
+            "array of sub-message variables, got: {consts}"
+        );
+    }
+
+    /// The `ɵɵi18nExp` operands of an ICU inside an i18n child view (an `*ngIf` element) belong to that
+    /// view's update block, and the view advances to the last slot its create ops reserved.
+    #[test]
+    fn icu_inside_structural_child_view_updates_in_that_view() {
+        let out = compile_template_html(
+            "<div i18n><span *ngIf=\"ok\">{a, select, x {x} other {y}}</span></div>",
+            "C",
+            false,
+        );
+        let child = out.find("function C_span_").or_else(|| out.find("function C_span")).expect("child view");
+        let body = &out[child..];
+        assert!(body.contains("\u{0275}\u{0275}advance()"), "child view advances to the element slot, got: {body}");
+        assert!(body.contains("\u{0275}\u{0275}i18nExp("), "child view i18nExp, got: {body}");
+        assert!(body.contains("\u{0275}\u{0275}i18nApply(0)"), "got: {body}");
+    }
+
+    /// A structural directive on an element inside an i18n block is ONE placeholder named after the
+    /// element, whose start value combines the template slot and the element slot
+    /// (`formatValue` with both `ElementTag` and `TemplateTag`), and whose `original_code` is the
+    /// authored start tag.
+    #[test]
+    fn structural_element_in_i18n_block_is_one_combined_placeholder() {
+        let consts = compile_template_consts("<div i18n><span *ngIf=\"x\">a</span></div>");
+        assert!(consts.contains("{$startTagSpan}a{$closeTagSpan}"), "one start/close pair, got: {consts}");
+        assert!(!consts.contains("startTagSpan_1"), "no duplicate placeholder, got: {consts}");
+        assert!(consts.contains(r#""startTagSpan": "�*2:1��#1:1�""#), "got: {consts}");
+        assert!(consts.contains(r#""startTagSpan": "<span *ngIf=\"x\">""#), "original code, got: {consts}");
     }
 }
 

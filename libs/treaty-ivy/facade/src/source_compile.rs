@@ -7142,6 +7142,16 @@ mod corpus_dump {
         out.push('"');
     }
 
+    /// The compliance loader's `monkeyPatchReadFile` (`test_helpers/compile_test.ts`): the corpus
+    /// sources spell `\r\n` line endings as escaped markers. Actual `\r\n` becomes `\n`; an escaped
+    /// marker at the end of a line (`\r\n` + newline) becomes a real CR LF; a double-escaped marker at the
+    /// end of a line stays escaped. The corpus dump must read the same text Angular's tests compile.
+    fn compliance_read_file_patch(file: &str) -> String {
+        file.replace("\r\n", "\n")
+            .replace("\\r\\n\n", "\r\n")
+            .replace("\\\\r\\\\n\n", "\\r\\n\n")
+    }
+
     /// Minimal extraction of `"inputFiles": ["x.ts"]` arrays from a TEST_CASES.json blob, returning
     /// every referenced single input-file name PAIRED with the per-case `legacyOptionalChaining` AND
     /// `linkerJitMode` compiler options (`angularCompilerOptions.{legacyOptionalChaining,linkerJit
@@ -7245,6 +7255,15 @@ mod corpus_dump {
     }
 
     #[test]
+    fn compliance_loader_turns_escaped_crlf_markers_into_real_line_endings() {
+        // `\r\n` + newline (an escaped marker at the end of a line) becomes one real CR LF; an actual
+        // CR LF becomes LF; a double-escaped marker keeps its escapes (`monkeyPatchReadFile`).
+        assert_eq!(compliance_read_file_patch("a\\r\\n\nb"), "a\r\nb");
+        assert_eq!(compliance_read_file_patch("a\r\nb"), "a\nb");
+        assert_eq!(compliance_read_file_patch("a\\\\r\\\\n\nb"), "a\\r\\n\nb");
+    }
+
+    #[test]
     #[ignore = "corpus dump; run explicitly with TREATY_IVY_CORPUS_DUMP set"]
     fn dump_corpus() {
         // The dump compiles the whole corpus through the recursive-descent front-end, which needs far
@@ -7302,6 +7321,7 @@ mod corpus_dump {
             for (input, legacy_optional_chaining, jit_mode) in input_files_in(&content) {
                 let input_path = dir.join(&input);
                 let Ok(src) = std::fs::read_to_string(&input_path) else { continue };
+                let src = compliance_read_file_patch(&src);
                 let rel = input_path
                     .strip_prefix(&corpus)
                     .unwrap_or(&input_path)

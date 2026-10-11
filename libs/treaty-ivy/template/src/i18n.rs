@@ -729,6 +729,11 @@ pub struct I18nPlaceholderParam {
     pub name: String,
     pub value: String,
     pub original_code: String,
+    /// `true` when `value` names a variable (the `$i18n_<n>$` of a sub-message, e.g. an ICU) rather
+    /// than a runtime magic string. Angular's `addSubMessageParams` sets the param to the sub-message's
+    /// variable expression, so the `goog.getMsg` value map and the `$localize` substitution read the
+    /// variable, unquoted.
+    pub var_ref: bool,
 }
 
 /// The result of lowering one i18n message into its closure-mode const-pool form.
@@ -759,6 +764,64 @@ pub struct I18nConstOpts {
     /// `('MSG_' + suffix).toUpperCase()` + `pool.uniqueName` index — e.g. an empty file path yields
     /// suffix `"_"` → prefix `"MSG__"` → `MSG__0` (matching `@angular/compiler`).
     pub file_suffix: String,
+    /// `postprocessingParams` of the message (`i18n_const_collection.ts` `getTranslationDeclStmts`
+    /// `transformFn`): the placeholders whose runtime value is only known after the message is
+    /// rendered, e.g. an ICU's `VAR_SELECT` expression. Each `(name, value)` pair, keyed by the
+    /// NON-camel placeholder name, becomes the `{ "NAME": "value" }` argument of
+    /// `ɵɵi18nPostprocess(i18n_<n>, {...})`, sorted by key as Angular sorts them.
+    pub postprocess_params: Vec<(String, I18nPostprocessValue)>,
+}
+
+/// The value of one postprocessing param (`postprocessingParams` entry).
+#[derive(Debug, Clone, PartialEq)]
+pub enum I18nPostprocessValue {
+    /// A runtime magic string (`\uFFFD0\uFFFD`, a tag/text of an ICU case, …).
+    Literal(String),
+    /// Several sub-message variables for one placeholder (`addSubMessageParams`): the array
+    /// `[$i18n_1$, $i18n_2$]` the runtime picks from by the ICU's expression.
+    Vars(Vec<String>),
+}
+
+/// `serializeIcuNode(icu)` (`render3/view/i18n/icu_serializer.ts`): the ICU text as it appears in the
+/// `$localize` / `goog.getMsg` string. Case bodies use the bare `{NAME}` placeholder form, unlike the
+/// `{$name}` form of the message string, and the switch expression is its placeholder name.
+pub fn serialize_icu_node(icu: &Icu) -> String {
+    let cases: Vec<String> = icu
+        .cases
+        .iter()
+        .map(|(k, n)| format!("{} {{{}}}", k, serialize_icu_case_node(n)))
+        .collect();
+    format!(
+        "{{{}, {}, {}}}",
+        icu.expression_placeholder.as_deref().unwrap_or(""),
+        icu.icu_type,
+        cases.join(" ")
+    )
+}
+
+/// `IcuSerializerVisitor` over a case body: text is literal, placeholders are `{NAME}`, and a nested
+/// ICU serializes recursively.
+fn serialize_icu_case_node(node: &Node) -> String {
+    let fmt_ph = |value: &str| format!("{{{}}}", format_i18n_placeholder_name(value, false));
+    match node {
+        Node::Text(t) => t.value.clone(),
+        Node::Container(c) => c.children.iter().map(serialize_icu_case_node).collect(),
+        Node::Icu(icu) => serialize_icu_node(icu),
+        Node::TagPlaceholder(ph) => {
+            if ph.is_void {
+                fmt_ph(&ph.start_name)
+            } else {
+                let children: String = ph.children.iter().map(serialize_icu_case_node).collect();
+                format!("{}{}{}", fmt_ph(&ph.start_name), children, fmt_ph(&ph.close_name))
+            }
+        }
+        Node::Placeholder(ph) => fmt_ph(&ph.name),
+        Node::IcuPlaceholder(ph) => fmt_ph(&ph.name),
+        Node::BlockPlaceholder(ph) => {
+            let children: String = ph.children.iter().map(serialize_icu_case_node).collect();
+            format!("{}{}{}", fmt_ph(&ph.start_name), children, fmt_ph(&ph.close_name))
+        }
+    }
 }
 
 /// Angular's `fileBasedI18nSuffix` (`render3/view/i18n/util.ts`): take the component's
@@ -832,11 +895,8 @@ fn serialize_node_for_get_msg(node: &Node) -> String {
     match node {
         Node::Text(t) => t.value.clone(),
         Node::Container(c) => c.children.iter().map(serialize_node_for_get_msg).collect(),
-        // ICU serialization is out of scope for the common (text/interpolation/tag/block) path;
-        // an ICU node would need `icu_serializer.ts`. The localize string serializer above
-        // already renders the ICU form when present, so this path is only reached for the
-        // placeholder-bearing messages the closure const builder handles.
-        Node::Icu(icu) => serialize_node_localize(&Node::Icu(icu.clone())),
+        // `GetMsgSerializerVisitor.visitIcu` = `serializeIcuNode` (bare `{NAME}` case placeholders).
+        Node::Icu(icu) => serialize_icu_node(icu),
         Node::TagPlaceholder(ph) => {
             if ph.is_void {
                 fmt_ph(&ph.start_name)
@@ -852,6 +912,16 @@ fn serialize_node_for_get_msg(node: &Node) -> String {
             let children: String = ph.children.iter().map(serialize_node_for_get_msg).collect();
             format!("{}{}{}", fmt_ph(&ph.start_name), children, fmt_ph(&ph.close_name))
         }
+    }
+}
+
+/// The expression an i18n placeholder param stands for: a variable reference for a sub-message
+/// (`var_ref`, e.g. an ICU's `$i18n_<n>$`), otherwise the runtime magic string literal.
+pub(crate) fn param_value_expr(p: &I18nPlaceholderParam) -> Expr {
+    if p.var_ref {
+        o::variable(p.value.clone(), None)
+    } else {
+        o::literal(LiteralValue::String(p.value.clone()), None)
     }
 }
 
@@ -911,7 +981,7 @@ pub fn build_i18n_const(
                 (
                     format_i18n_placeholder_name(&p.name, true),
                     true,
-                    o::literal(LiteralValue::String(p.value.clone()), None),
+                    param_value_expr(p),
                 )
             })
             .collect();
@@ -982,9 +1052,34 @@ pub fn build_i18n_const(
     // than one position (the `[�…�|�…�]` form), the message string is postprocessed at runtime to
     // re-expand those merged placeholders. Angular appends, after the closure guard,
     // `i18n_<n> = ɵɵi18nPostprocess(i18n_<n>);`.
-    if opts.needs_postprocess {
+    // `transformFn` (`i18n_const_collection.ts`): `ɵɵi18nPostprocess(var[, {postprocessingParams}])`,
+    // applied when the message needs postprocessing or carries postprocessing params.
+    if opts.needs_postprocess || !opts.postprocess_params.is_empty() {
+        let mut args: Vec<Expr> = vec![main_var.clone()];
+        if !opts.postprocess_params.is_empty() {
+            let mut entries = opts.postprocess_params.clone();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            // `formatI18nPlaceholderNamesInMap(postprocessingParams, false)`: the sorted raw names are
+            // formatted to their public form (`PH WITH SPACES` -> `PH_WITH_SPACES`).
+            let map_entries: Vec<(String, bool, Expr)> = entries
+                .into_iter()
+                .map(|(name, value)| {
+                    let name = format_i18n_placeholder_name(&name, false);
+                    let expr = match value {
+                        I18nPostprocessValue::Literal(text) => {
+                            o::literal(LiteralValue::String(text), None)
+                        }
+                        I18nPostprocessValue::Vars(vars) => {
+                            o::literal_arr(vars.into_iter().map(|v| o::variable(v, None)).collect(), None)
+                        }
+                    };
+                    (name, true, expr)
+                })
+                .collect();
+            args.push(o::literal_map(map_entries, None));
+        }
         let postprocess = o::import_expr(R3::I18nPostprocess.reference(), None)
-            .call_fn(vec![main_var.clone()], false);
+            .call_fn(args, false);
         initializers.push(Stmt::bare(StmtKind::Expression(
             main_var.clone().set(postprocess),
         )));

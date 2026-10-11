@@ -500,7 +500,9 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 source_span: to_offset_span(&element.source_span),
                 start_source_span: to_offset_span(&element.start_source_span),
                 end_source_span: to_offset_span_opt(&element.end_source_span),
-                i18n: None,
+                // `new t.Template(..., element.i18n)`: an explicit `<ng-template i18n>` keeps its message,
+                // which makes its view an i18n block.
+                i18n: element_i18n.clone(),
             })
         } else {
             let attrs = self
@@ -1770,32 +1772,53 @@ fn has_preserve_ws_attr(attrs: &[html::Attribute]) -> bool {
 /// `removeWhitespaces` / `WhitespaceVisitor` applied to a sibling list.
 ///
 /// This mirrors how the render3 template parser drives the visitor when `preserveWhitespaces` is
-/// false: `preserveSignificantWhitespace = true` and `requireContext = false`. Under those flags
-/// the visitor never trims leading/trailing whitespace of a non-blank text node (no sibling
-/// context), but it still:
-///   - drops text nodes that are entirely whitespace,
-///   - collapses internal whitespace runs to a single space,
-///   - converts the &ngsp; marker to a space,
-///   - and recurses into element/component/block/expansion-case children (except inside
-///     whitespace-preserving tags or subtrees marked `ngPreserveWhitespaces`).
+/// false: `preserveSignificantWhitespace = true`. Under those flags (`html_whitespaces.ts`
+/// `WhitespaceVisitor.visitText`):
+///   - content inside an ICU expansion is returned unchanged (`icuExpansionDepth > 0`),
+///   - a text node is kept, with its whitespace processed, when it is not blank OR a sibling is an
+///     ICU expansion (`hasExpansionSibling`: the whitespace between an ICU and its neighbours is
+///     significant); any other whitespace-only text node is dropped,
+///   - internal whitespace runs collapse to a single space, `&ngsp;` becomes a space,
+///   - it recurses into element/component/block/expansion-case children, except inside
+///     whitespace-preserving tags or subtrees marked `ngPreserveWhitespaces`.
 fn remove_whitespaces(nodes: &[html::Node]) -> Vec<html::Node> {
+    // The template root is visited with `html.visitAll` and `requireContext = false` (r3 `parseTemplate`),
+    // so its text nodes have no sibling context: a root whitespace-only text next to an ICU is dropped.
+    remove_whitespaces_in(nodes, 0, false)
+}
+
+/// [`remove_whitespaces`] for a sibling list at ICU nesting depth `icu_depth` (`icuExpansionDepth`).
+/// `with_context` is `true` when the list is visited with `visitAllWithSiblings` (every nested list);
+/// the template root is not, so `hasExpansionSibling` is false there.
+fn remove_whitespaces_in(nodes: &[html::Node], icu_depth: usize, with_context: bool) -> Vec<html::Node> {
     let mut out = Vec::with_capacity(nodes.len());
-    for node in nodes {
+    for (i, node) in nodes.iter().enumerate() {
         match node {
             html::Node::Text(text) => {
-                if has_non_ws(&text.value) {
+                // `visitAllWithSiblings` context: the neighbouring sibling nodes.
+                let prev = i.checked_sub(1).and_then(|p| nodes.get(p)).filter(|_| with_context);
+                let next = nodes.get(i + 1).filter(|_| with_context);
+                if icu_depth > 0 {
+                    // "Do not trim whitespace within ICU expansions when preserving significant
+                    // whitespace": the text node is returned as it is.
+                    out.push(html::Node::Text(text.clone()));
+                    continue;
+                }
+                let has_expansion_sibling = matches!(prev, Some(html::Node::Expansion(_)))
+                    || matches!(next, Some(html::Node::Expansion(_)));
+                if has_non_ws(&text.value) || has_expansion_sibling {
                     let mut new_text = (**text).clone();
                     new_text.value = process_whitespace(&text.value);
                     out.push(html::Node::Text(Box::new(new_text)));
                 }
-                // else: whitespace-only text node is dropped.
+                // else: a whitespace-only text node with no ICU neighbour is dropped.
             }
             html::Node::Element(e) => {
                 let mut new_e = (**e).clone();
                 if !(SKIP_WS_TRIM_TAGS.contains(&e.name.as_str())
                     || has_preserve_ws_attr(&e.attrs))
                 {
-                    new_e.children = remove_whitespaces(&e.children);
+                    new_e.children = remove_whitespaces_in(&e.children, icu_depth, true);
                 }
                 // Drop the `ngPreserveWhitespaces` marker attribute (visitAttribute returns null).
                 new_e
@@ -1811,7 +1834,7 @@ fn remove_whitespaces(nodes: &[html::Node]) -> Vec<html::Node> {
                     .is_some_and(|t| SKIP_WS_TRIM_TAGS.contains(&t))
                     || has_preserve_ws_attr(&c.attrs);
                 if !skip {
-                    new_c.children = remove_whitespaces(&c.children);
+                    new_c.children = remove_whitespaces_in(&c.children, icu_depth, true);
                 }
                 new_c
                     .attrs
@@ -1820,16 +1843,17 @@ fn remove_whitespaces(nodes: &[html::Node]) -> Vec<html::Node> {
             }
             html::Node::Block(b) => {
                 let mut new_b = (**b).clone();
-                new_b.children = remove_whitespaces(&b.children);
+                new_b.children = remove_whitespaces_in(&b.children, icu_depth, true);
                 out.push(html::Node::Block(Box::new(new_b)));
             }
             html::Node::Expansion(e) => {
+                // `visitExpansion` increments `icuExpansionDepth` around its cases.
                 let mut new_e = (**e).clone();
                 new_e.cases = new_e
                     .cases
                     .into_iter()
                     .map(|mut case| {
-                        case.expression = remove_whitespaces(&case.expression);
+                        case.expression = remove_whitespaces_in(&case.expression, icu_depth + 1, true);
                         case
                     })
                     .collect();
@@ -2940,6 +2964,65 @@ mod tests {
         let empty = attr("disabled2").value_span.as_ref().expect("value span for disabled2=\"\"");
         assert_eq!(empty.start.offset, empty.end.offset);
         assert_eq!(attr("value").value_span.as_ref().unwrap().to_source_string(), "v");
+    }
+
+    /// `WhitespaceVisitor.visitText` with `hasExpansionSibling`: whitespace-only text next to an ICU is
+    /// significant inside an element, so it survives (collapsed, `processWhitespace`) and the
+    /// `multiple_icus` golden's `' {$icu} {$icu_1} '` message keeps its spaces.
+    #[test]
+    fn whitespace_next_to_an_icu_is_kept_inside_an_element() {
+        let nodes = parse_html("<div>\n  {a, select, x {x} other {y}}\n</div>");
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let t::Node::Element(div) = &result.nodes[0] else {
+            panic!("expected element, got {:?}", result.nodes)
+        };
+        let kinds: Vec<&str> = div
+            .children
+            .iter()
+            .map(|n| match n {
+                t::Node::Text(t) => t.value.as_str(),
+                t::Node::Icu(_) => "icu",
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        // `processWhitespace` collapses runs of two or more whitespace characters only, so the lone
+        // newline after the ICU is kept as it is.
+        assert_eq!(kinds, vec![" ", "icu", "\n"]);
+    }
+
+    /// The template root is visited without sibling context (`html.visitAll`, `requireContext = false`):
+    /// its whitespace-only text is dropped even next to an ICU.
+    #[test]
+    fn whitespace_next_to_an_icu_is_dropped_at_the_template_root() {
+        let nodes = parse_html("\n  {a, select, x {x} other {y}}\n");
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        assert_eq!(result.nodes.len(), 1, "{:?}", result.nodes);
+        assert!(matches!(result.nodes[0], t::Node::Icu(_)));
+    }
+
+    /// Inside an ICU case the text is returned unchanged (`icuExpansionDepth > 0` with
+    /// `preserveSignificantWhitespace`): runs of spaces are not collapsed.
+    #[test]
+    fn whitespace_inside_an_icu_case_is_not_collapsed() {
+        let nodes = parse_html("{a, select, x {a   b} other {y}}");
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let t::Node::Icu(icu) = &result.nodes[0] else {
+            panic!("expected icu, got {:?}", result.nodes)
+        };
+        let Some(t::I18nMeta::Message(message)) = &icu.i18n else {
+            panic!("icu carries its message")
+        };
+        let crate::i18n::Node::Icu(inner) = &message.nodes[0] else {
+            panic!("message holds the icu, got {:?}", message.nodes)
+        };
+        let case = &inner.cases.iter().find(|(k, _)| k == "x").expect("case x").1;
+        let crate::i18n::Node::Container(c) = case else {
+            panic!("case body is a container, got {case:?}")
+        };
+        assert!(matches!(&c.children[0], crate::i18n::Node::Text(t) if t.value == "a   b"), "{:?}", c.children);
     }
 
     #[test]
